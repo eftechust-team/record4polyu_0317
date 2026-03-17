@@ -9,71 +9,123 @@
 </head>
 <body class="form-page">
     <div class="top-bar">
-        <img src="/static/logo.jpeg" alt="Logo" style="max-height: 48px; height: auto; flex-shrink: 0;">
-
-        <!-- Navigation switch: 飲食記錄 | 活動記錄 -->
-        <div class="nav-switch">
-            <a href="/form" class="nav-btn active">飲食記錄</a>
-            <a href="/exercise" class="nav-btn">活動記錄</a>
-        </div>
-
-        <div style="display: flex; align-items: center; gap: 12px; flex-shrink: 0;">
+        <a href="/hub" style="display:inline-flex; align-items:center; text-decoration:none;">
+            <img src="/static/logo.jpeg" alt="Logo" style="max-height: 48px; height: auto; flex-shrink: 0; cursor: pointer;">
+        </a>
+        <div style="display: flex; align-items: center; gap: 12px; flex-shrink: 0; margin-left: auto;">
             <span>歡迎，{{ session.get('name', '參與者') }} (編號: {{ session.get('participant_id', '') }})</span>
-            <button onclick="logout()" class="logout-btn">登出</button>
+            <button type="button" onclick="logout()" class="logout-btn">登出</button>
         </div>
     </div>
 
-    <div class="form-container">
-        <div class="form-content">
-            <!-- Right Section: Chatbot Assistant (now full width) -->
-            <div class="right-section">
-                <div style="display: flex; justify-content: center; align-items: center; margin-bottom: 15px; position: relative;">
-                    <h2 class="section-title">飲食記錄</h2>
-                    <button id="helpBtn" style="background: white; border: 2px solid var(--accent); color: var(--accent); width: 40px; height: 40px; padding: 0; box-sizing: border-box; border-radius: 50%; cursor: pointer; font-size: 18px; font-weight: bold; transition: all 0.3s; display: flex; align-items: center; justify-content: center; position: absolute; right: 0;">?</button>
+    <div class="form-container" style="width: 100%; max-width: 1200px; margin: 0 auto;">
+        <div class="content">
+            <div style="display: flex; justify-content: center; align-items: center; margin-bottom: 15px; position: relative;">
+                <h2 class="section-title">飲食記錄</h2>
+                <button type="button" id="helpBtn" style="background: white; border: 2px solid var(--accent); color: var(--accent); width: 40px; height: 40px; padding: 0; box-sizing: border-box; border-radius: 50%; cursor: pointer; font-size: 18px; font-weight: bold; transition: all 0.3s; display: flex; align-items: center; justify-content: center; position: absolute; right: 0;">?</button>
+            </div>
+
+            <div id="dateSection" class="exercise-section">
+                <h3 style="color: var(--text); font-size: 16px; margin-bottom: 12px;">請先選擇記錄日期：</h3>
+                <div style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 15px;">
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="radio" name="recordDate" value="workday1" style="margin-right: 8px;">
+                        <span>第一個工作日</span>
+                    </label>
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="radio" name="recordDate" value="workday2" style="margin-right: 8px;">
+                        <span>第二個工作日</span>
+                    </label>
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="radio" name="recordDate" value="restday" style="margin-right: 8px;">
+                        <span>第一個休息日</span>
+                    </label>
                 </div>
-                
-                <div class="chatbot-container">
-                    <div id="chatMessages" class="chat-messages">
-                        <div class="bot-message">
-                            <div class="message-content">
-                                <strong>記錄流程</strong><br>
-                                Step 1：選擇記錄日期<br>
-                                Step 2：選擇餐次記錄卡片<br>
-                                Step 3：拍照上傳您的飲食圖片並給出簡單的文字描述
-                            </div>
-                        </div>
-                        <div class="bot-message">
-                            <div class="message-content">
-                                <strong>記錄日期：</strong><br>
-                                <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 8px;">
-                                    <label style="display: flex; align-items: center; cursor: pointer;">
-                                        <input type="radio" name="recordDate" value="workday1" style="margin-right: 8px;">
-                                        <span>第一個工作日</span>
-                                    </label>
-                                    <label style="display: flex; align-items: center; cursor: pointer;">
-                                        <input type="radio" name="recordDate" value="workday2" style="margin-right: 8px;">
-                                        <span>第二個工作日</span>
-                                    </label>
-                                    <label style="display: flex; align-items: center; cursor: pointer;">
-                                        <input type="radio" name="recordDate" value="restday" style="margin-right: 8px;">
-                                        <span>第一個休息日</span>
-                                    </label>
-                                </div>
-                                <button onclick="confirmDateSelection()" style="width: 100%; margin-top: 12px; padding: 8px; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: bold;">確認</button>
-                            </div>
+                <button type="button" onclick="confirmMealDate()" class="submit-info-btn" style="width: 120px; padding: 10px;">確認日期</button>
+            </div>
+
+            <div id="mealEntrySection" class="exercise-section" style="display: none;">
+                <h3 id="mealEntryTitle" style="color: var(--text); font-size: 16px; margin-bottom: 12px;">添加飲食記錄</h3>
+
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 18px;">
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>餐次：</label>
+                        <select id="mealType" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px; font-family: 'Microsoft JhengHei', 'PingFang HK', 'Noto Sans TC', sans-serif;">
+                            <option value="">請選擇餐次</option>
+                            <option value="早餐">早餐</option>
+                            <option value="上午加餐">上午加餐</option>
+                            <option value="午餐">午餐</option>
+                            <option value="下午加餐">下午加餐</option>
+                            <option value="晚餐">晚餐</option>
+                            <option value="晚上加餐">晚上加餐</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>用餐時間：</label>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <button type="button" class="submit-info-btn" style="width: auto; min-width: 88px; padding: 10px 16px; flex-shrink: 0;" onclick="setCurrentMealTime()">此刻</button>
+                            <input id="mealTimePicker" type="time" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px; font-family: 'Microsoft JhengHei', 'PingFang HK', 'Noto Sans TC', sans-serif;">
                         </div>
                     </div>
-                    
-                    <div class="chat-input-area">
-                        <input type="text" id="chatInput" placeholder="輸入訊息..." disabled>
-                        <button id="chatSend" disabled>發送</button>
-                        <button id="resetBtn" class="reset-btn">重新開始</button>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 18px;">
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>用餐地點：</label>
+                        <select id="mealLocation" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px; font-family: 'Microsoft JhengHei', 'PingFang HK', 'Noto Sans TC', sans-serif;">
+                            <option value="">請選擇用餐地點</option>
+                            <option value="家">家</option>
+                            <option value="工作單位">工作單位</option>
+                            <option value="餐廳/外賣">餐廳/外賣</option>
+                            <option value="其他">其他</option>
+                        </select>
                     </div>
-                    
-                    <div id="actionButtons" class="action-buttons-container" style="display: none; padding: 15px; gap: 10px; background-color: var(--card-bg); border-top: 1px solid var(--border);">
-                        <button class="action-btn new-record-btn" onclick="startNewRecord()">開始新記錄</button>
-                        <button class="action-btn finish-btn" onclick="finishDailyRecord()">完成今日飲食記錄</button>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>進食情況：</label>
+                        <select id="mealAmount" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px; font-family: 'Microsoft JhengHei', 'PingFang HK', 'Noto Sans TC', sans-serif;">
+                            <option value="">請選擇進食情況</option>
+                            <option value="全部吃完">全部吃完</option>
+                            <option value="剩餘一些">剩餘一些</option>
+                            <option value="只吃少量">只吃少量</option>
+                        </select>
                     </div>
+                </div>
+
+                <div class="form-group">
+                    <label>圖片與食物描述：</label>
+                    <div class="meal-table-wrap">
+                        <table class="meal-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 260px;">圖片</th>
+                                    <th>描述（食物 / 份量）</th>
+                                    <th style="width: 120px;">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mealRowsBody"></tbody>
+                        </table>
+                    </div>
+                    <button type="button" onclick="addImageRow()" class="submit-info-btn" style="margin-top: 10px; background: #2563eb;">新增一列（圖片+描述）</button>
+                </div>
+
+                <div class="form-group">
+                    <label>補充描述（可選）：</label>
+                    <textarea id="additionalDescription" rows="3" placeholder="例如：湯底較油、加了糖、與他人分食等" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px; font-family: 'Microsoft JhengHei', 'PingFang HK', 'Noto Sans TC', sans-serif; resize: vertical;"></textarea>
+                </div>
+
+                <div style="display: flex; gap: 10px; flex-direction: column;">
+                    <div style="display: flex; gap: 10px;">
+                        <button id="saveMealBtn" type="button" onclick="saveMealRecord()" class="submit-info-btn" style="padding: 12px 40px; flex: 1;">添加記錄</button>
+                        <button type="button" onclick="resetMealForm()" class="submit-info-btn" style="padding: 12px 40px; flex: 1; background: #9ca3af;">清空本次輸入</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="mealListSection" class="exercise-section" style="display: none; margin-top: 25px;">
+                <h4 id="mealListTitle" style="color: var(--text); font-size: 15px; margin-bottom: 10px;">飲食記錄</h4>
+                <div id="mealItems"></div>
+                <div style="display:flex; justify-content:flex-end; margin-top:12px;">
+                    <button type="button" class="submit-info-btn" style="width:auto; padding:10px 20px;" onclick="window.location.href='/hub'">返回首頁</button>
                 </div>
             </div>
         </div>
@@ -114,7 +166,7 @@
         </div>
     </div>
 
-    <script src="/static/js/form-script.js?v=20260121-shared-desc"></script>
+    <script src="/static/js/form-script.js?v=20260317-time-order-sort"></script>
      <script>
     async function logout() {
         if (confirm('確定要登出嗎？')) {

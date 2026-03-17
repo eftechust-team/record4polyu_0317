@@ -19,9 +19,53 @@ print("Flask app created")
 SUPABASE_URL = 'https://urmhsphzfmtciybqdptw.supabase.co'
 SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVybWhzcGh6Zm10Y2l5YnFkcHR3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg3ODgxOTcsImV4cCI6MjA4NDM2NDE5N30.f9zVtTgY0yK6ispISE62MyGmmCV5UuzXqXHonVg2cPE'
 
+_supabase_client: Client = None
+
+def _make_supabase_client() -> Client:
+    """Create a fresh Supabase client."""
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def get_supabase() -> Client:
+    """Return the global Supabase client, recreating it if it was never initialised."""
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = _make_supabase_client()
+    return _supabase_client
+
+def reset_supabase():
+    """Discard the current client so the next call to get_supabase() gets a fresh one."""
+    global _supabase_client
+    _supabase_client = None
+
+def _is_connection_error(e: Exception) -> bool:
+    err_str = str(e)
+    return (
+        isinstance(e, (ConnectionRefusedError, ConnectionResetError, OSError))
+        or 'WinError 10061' in err_str
+        or 'WinError 10054' in err_str
+        or 'ConnectError' in type(e).__name__
+        or 'RemoteProtocolError' in type(e).__name__
+    )
+
+
+class _SupabaseProxy:
+    """Transparent proxy that auto-recreates the underlying client on connection errors.
+
+    All attribute access is forwarded to the real client.  When a connection
+    error is detected the proxy discards the stale client so the next request
+    gets a brand-new one.
+    """
+
+    def reset(self):
+        reset_supabase()
+
+    def __getattr__(self, name: str):
+        return getattr(get_supabase(), name)
+
 print(f"Connecting to Supabase: {SUPABASE_URL[:30]}...")
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supabase = _SupabaseProxy()
+    get_supabase()   # eagerly test the connection at startup
     print("Supabase client created successfully")
 except Exception as e:
     print(f"ERROR creating Supabase client: {e}")
@@ -39,9 +83,9 @@ def index():
 
 @app.route('/login')
 def login_page():
-    # If already logged in, redirect to form
+    # If already logged in, redirect to workflow hub
     if 'user_id' in session:
-        return redirect(url_for('form_page'))
+        return redirect(url_for('hub_page'))
     return render_template('login.html')
 
 @app.route('/api/login', methods=['POST'])
@@ -66,7 +110,7 @@ def login():
         session['participant_id'] = user['participant_id']
         session['name'] = user['name']
         
-        return jsonify({'success': True, 'message': '登入成功', 'redirect': '/form'})
+        return jsonify({'success': True, 'message': '登入成功', 'redirect': '/hub'})
         
     except Exception as e:
         print(f"Login error: {e}")
@@ -101,7 +145,7 @@ def register():
         session['participant_id'] = user['participant_id']
         session['name'] = user['name']
         
-        return jsonify({'success': True, 'message': '註冊成功', 'redirect': '/form'})
+        return jsonify({'success': True, 'message': '註冊成功', 'redirect': '/hub'})
         
     except Exception as e:
         error_msg = str(e)
@@ -121,6 +165,12 @@ def form_page():
     
     return render_template('form.html')
 
+@app.route('/hub')
+def hub_page():
+    if 'user_id' not in session:
+        return redirect(url_for('login_page'))
+    return render_template('hub.html')
+
 @app.route('/exercise')
 def exercise_page():
     # Check if user is logged in
@@ -138,7 +188,8 @@ def save_meal_record():
         data = request.get_json()
         participant_id = session['participant_id']
         
-        print(f"Received data: {data}")  # Debug logging
+        # Avoid logging full payload because base64 photos can be very large.
+        print(f"Received meal payload: participant_id={participant_id}, record_date={data.get('record_date')}, photos={len(data.get('photos', []))}")
         
         # Extract data
         record_date = data.get('record_date')  # 'workday1', 'workday2', 'restday'
@@ -163,14 +214,14 @@ def save_meal_record():
         if not all([record_date, record_date_label, meal_type]):
             return jsonify({'success': False, 'message': '缺少必填資訊'}), 400
         
-        # Step 1: Get or create daily_record
-        daily_record_response = supabase.table('daily_records')\
+        # Step 1: Get or create meal_daily_record
+        daily_record_response = supabase.table('meal_daily_records')\
             .select('id')\
             .eq('participant_id', participant_id)\
             .eq('record_date', record_date)\
             .execute()
         
-        print(f"Daily record query response: {daily_record_response.data}")  # Debug logging
+        print(f"Daily record query found: {len(daily_record_response.data or [])}")
         
         if daily_record_response.data and len(daily_record_response.data) > 0:
             daily_record_id = int(daily_record_response.data[0]['id'])
@@ -184,11 +235,11 @@ def save_meal_record():
                 'is_completed': False
             }
             
-            print(f"Creating new daily record: {new_daily_record}")  # Debug logging
+            print(f"Creating new meal_daily_record for participant_id={participant_id}, record_date={record_date}")
             
-            daily_record_insert = supabase.table('daily_records').insert(new_daily_record).execute()
+            daily_record_insert = supabase.table('meal_daily_records').insert(new_daily_record).execute()
             
-            print(f"Daily record insert response: {daily_record_insert.data}")  # Debug logging
+            print(f"Daily record insert success: {bool(daily_record_insert.data)}")
             
             if not daily_record_insert.data or len(daily_record_insert.data) == 0:
                 return jsonify({'success': False, 'message': '創建日記錄失敗'}), 500
@@ -213,11 +264,11 @@ def save_meal_record():
             'photo_count': photo_count
         }
         
-        print(f"Creating meal record: {meal_record_data}")  # Debug logging
+        print(f"Creating meal record: participant_id={participant_id}, record_date={record_date}, meal_type={meal_type}")
         
         meal_record_response = supabase.table('meal_records').insert(meal_record_data).execute()
         
-        print(f"Meal record insert response: {meal_record_response.data}")  # Debug logging
+        print(f"Meal record insert success: {bool(meal_record_response.data)}")
         
         if not meal_record_response.data or len(meal_record_response.data) == 0:
             return jsonify({'success': False, 'message': '創建餐次記錄失敗'}), 500
@@ -238,11 +289,11 @@ def save_meal_record():
                 }
                 photo_records.append(photo_record)
             
-            print(f"Saving {len(photo_records)} photos")  # Debug logging
+            print(f"Saving {len(photo_records)} meal photos")
             
             photos_response = supabase.table('food_photos').insert(photo_records).execute()
             
-            print(f"Photos insert response: {len(photos_response.data) if photos_response.data else 0} photos saved")  # Debug logging
+            print(f"Photos insert saved: {len(photos_response.data) if photos_response.data else 0}")
             
             if not photos_response.data:
                 print("Warning: Failed to save some photos")
@@ -258,6 +309,9 @@ def save_meal_record():
         print(f"Save meal record error: {e}")
         import traceback
         traceback.print_exc()
+        if _is_connection_error(e):
+            supabase.reset()
+            print("Supabase client reset due to connection error — will reconnect on next request")
         return jsonify({'success': False, 'message': f'保存記錄時發生錯誤: {str(e)}'}), 500
 
 @app.route('/api/complete-daily-record', methods=['POST'])
@@ -276,8 +330,8 @@ def complete_daily_record():
         
         print(f"Completing daily record for {participant_id}, {record_date}")  # Debug logging
         
-        # Update daily_record to mark as completed
-        update_response = supabase.table('daily_records')\
+        # Update meal_daily_record to mark as completed
+        update_response = supabase.table('meal_daily_records')\
             .update({'is_completed': True})\
             .eq('participant_id', participant_id)\
             .eq('record_date', record_date)\
@@ -295,6 +349,150 @@ def complete_daily_record():
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'message': '標記完成時發生錯誤'}), 500
+
+@app.route('/api/get-meal-records', methods=['GET'])
+def get_meal_records():
+    try:
+        if 'participant_id' not in session:
+            return jsonify({'success': False, 'message': '請先登入'}), 401
+
+        participant_id = session['participant_id']
+        record_date = request.args.get('record_date')
+
+        if not record_date:
+            return jsonify({'success': False, 'message': '缺少記錄日期'}), 400
+
+        meal_response = supabase.table('meal_records')\
+            .select('*')\
+            .eq('participant_id', participant_id)\
+            .eq('record_date', record_date)\
+            .order('id')\
+            .execute()
+
+        records = meal_response.data if meal_response.data else []
+        result = []
+
+        # Bulk-load photos for all meal records to avoid N+1 API calls.
+        meal_ids = [r['id'] for r in records if r.get('id') is not None]
+        photos_by_meal_id = {}
+        if meal_ids:
+            try:
+                photo_response = supabase.table('food_photos')\
+                    .select('*')\
+                    .in_('meal_record_id', meal_ids)\
+                    .order('meal_record_id')\
+                    .order('photo_order')\
+                    .execute()
+
+                for p in (photo_response.data or []):
+                    meal_id = p.get('meal_record_id')
+                    if meal_id not in photos_by_meal_id:
+                        photos_by_meal_id[meal_id] = []
+                    photos_by_meal_id[meal_id].append(p)
+            except Exception as photo_err:
+                # Keep response usable even if photo query fails.
+                print(f"Photo bulk query warning: {photo_err}")
+                photos_by_meal_id = {}
+
+        for r in records:
+            result.append({
+                'meal_record': r,
+                'photos': photos_by_meal_id.get(r.get('id'), [])
+            })
+
+        return jsonify({'success': True, 'records': result})
+    except Exception as e:
+        print(f"Get meal records error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'獲取飲食記錄時發生錯誤: {str(e)}'}), 500
+
+@app.route('/api/update-meal-record/<int:meal_record_id>', methods=['PUT'])
+def update_meal_record(meal_record_id):
+    try:
+        if 'participant_id' not in session:
+            return jsonify({'success': False, 'message': '請先登入'}), 401
+
+        participant_id = session['participant_id']
+        data = request.get_json()
+
+        update_data = {
+            'meal_type': data.get('meal_type'),
+            'meal_time': data.get('meal_time') or None,
+            'location': data.get('location') or None,
+            'eating_amount': data.get('eating_amount') or None,
+            'additional_description': data.get('additional_description') or None
+        }
+
+        response = supabase.table('meal_records')\
+            .update(update_data)\
+            .eq('id', meal_record_id)\
+            .eq('participant_id', participant_id)\
+            .execute()
+
+        if not response.data:
+            return jsonify({'success': False, 'message': '更新失敗或找不到記錄'}), 404
+
+        # Optional: replace meal photos when full in-card edit submits photos payload.
+        if isinstance(data.get('photos'), list):
+            photos = data.get('photos') or []
+
+            supabase.table('food_photos')\
+                .delete()\
+                .eq('meal_record_id', meal_record_id)\
+                .eq('participant_id', participant_id)\
+                .execute()
+
+            if photos:
+                photo_records = []
+                for idx, item in enumerate(photos):
+                    photo_records.append({
+                        'meal_record_id': meal_record_id,
+                        'participant_id': participant_id,
+                        'photo_data': item.get('photo_data', ''),
+                        'description': item.get('description', ''),
+                        'photo_order': idx
+                    })
+
+                supabase.table('food_photos').insert(photo_records).execute()
+
+        return jsonify({'success': True, 'message': '飲食記錄已更新'})
+    except Exception as e:
+        print(f"Update meal record error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'更新飲食記錄時發生錯誤: {str(e)}'}), 500
+
+@app.route('/api/delete-meal-record/<int:meal_record_id>', methods=['DELETE'])
+def delete_meal_record(meal_record_id):
+    try:
+        if 'participant_id' not in session:
+            return jsonify({'success': False, 'message': '請先登入'}), 401
+
+        participant_id = session['participant_id']
+
+        # Delete photos first, then meal record.
+        supabase.table('food_photos')\
+            .delete()\
+            .eq('meal_record_id', meal_record_id)\
+            .eq('participant_id', participant_id)\
+            .execute()
+
+        delete_response = supabase.table('meal_records')\
+            .delete()\
+            .eq('id', meal_record_id)\
+            .eq('participant_id', participant_id)\
+            .execute()
+
+        if not delete_response.data:
+            return jsonify({'success': False, 'message': '刪除失敗或找不到記錄'}), 404
+
+        return jsonify({'success': True, 'message': '飲食記錄已刪除'})
+    except Exception as e:
+        print(f"Delete meal record error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'刪除飲食記錄時發生錯誤: {str(e)}'}), 500
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
@@ -321,7 +519,7 @@ def save_exercise_record():
         description = data.get('description', '')
         
         # Validation
-        if not all([record_date, start_time, end_time, exercise_type, intensity]):
+        if not all([record_date, start_time, end_time, exercise_type]):
             return jsonify({'success': False, 'message': '缺少必填資訊'}), 400
         
         # Create exercise record
@@ -332,7 +530,7 @@ def save_exercise_record():
             'start_time': start_time,
             'end_time': end_time,
             'exercise_type': exercise_type,
-            'intensity': intensity,
+            'intensity': intensity if intensity else None,
             'description': description if description else None
         }
         
@@ -356,6 +554,9 @@ def save_exercise_record():
         print(f"Save exercise record error: {e}")
         import traceback
         traceback.print_exc()
+        if _is_connection_error(e):
+            supabase.reset()
+            print("Supabase client reset due to connection error — will reconnect on next request")
         return jsonify({'success': False, 'message': f'保存記錄時發生錯誤: {str(e)}'}), 500
 
 @app.route('/api/get-exercise-records', methods=['GET'])
@@ -388,6 +589,63 @@ def get_exercise_records():
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'message': f'獲取記錄時發生錯誤: {str(e)}'}), 500
+
+@app.route('/api/update-exercise-record/<int:record_id>', methods=['PUT'])
+def update_exercise_record(record_id):
+    try:
+        if 'participant_id' not in session:
+            return jsonify({'success': False, 'message': '請先登入'}), 401
+
+        participant_id = session['participant_id']
+        data = request.get_json()
+
+        update_data = {
+            'start_time': data.get('start_time'),
+            'end_time': data.get('end_time'),
+            'exercise_type': data.get('exercise_type'),
+            'intensity': data.get('intensity') or None,
+            'description': data.get('description') or None
+        }
+
+        response = supabase.table('exercise_records')\
+            .update(update_data)\
+            .eq('id', record_id)\
+            .eq('participant_id', participant_id)\
+            .execute()
+
+        if not response.data:
+            return jsonify({'success': False, 'message': '更新失敗或找不到記錄'}), 404
+
+        return jsonify({'success': True, 'message': '活動記錄已更新'})
+    except Exception as e:
+        print(f"Update exercise record error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'更新活動記錄時發生錯誤: {str(e)}'}), 500
+
+@app.route('/api/delete-exercise-record/<int:record_id>', methods=['DELETE'])
+def delete_exercise_record(record_id):
+    try:
+        if 'participant_id' not in session:
+            return jsonify({'success': False, 'message': '請先登入'}), 401
+
+        participant_id = session['participant_id']
+
+        response = supabase.table('exercise_records')\
+            .delete()\
+            .eq('id', record_id)\
+            .eq('participant_id', participant_id)\
+            .execute()
+
+        if not response.data:
+            return jsonify({'success': False, 'message': '刪除失敗或找不到記錄'}), 404
+
+        return jsonify({'success': True, 'message': '活動記錄已刪除'})
+    except Exception as e:
+        print(f"Delete exercise record error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'message': f'刪除活動記錄時發生錯誤: {str(e)}'}), 500
 
 @app.route('/api/complete-exercise-day', methods=['POST'])
 def complete_exercise_day():

@@ -1,2022 +1,990 @@
-// Save user info to localStorage for cross-page persistence
-function saveUserInfoToStorage() {
-    const name = document.getElementById('name')?.value;
-    const participantId = document.getElementById('participantId')?.value;
-    const gender = document.querySelector('input[name="gender"]:checked')?.value;
-    const age = document.getElementById('age')?.value;
-    
-    if (name || participantId || gender || age) {
-        const userInfo = { name, participantId, gender, age };
-        localStorage.setItem('userInfo', JSON.stringify(userInfo));
+let selectedDate = '';
+let selectedDateLabel = '';
+let selectedRealDate = '';
+let pageMode = 'add';
+
+let imageRows = [];
+let imageRowIdSeed = 1;
+let foodRowIdSeed = 1;
+let pendingImageProcesses = 0;
+let currentMealBundles = [];
+let editingMealRecordId = null;
+let editingMealDraft = null;
+let editPhotoRowIdSeed = 1;
+let editFoodRowIdSeed = 1;
+
+const recordDateLabels = {
+    workday1: '第一個工作日',
+    workday2: '第二個工作日',
+    restday: '第一個休息日'
+};
+
+function getQueryParams() {
+    return new URLSearchParams(window.location.search);
+}
+
+function createFoodRow() {
+    return { id: foodRowIdSeed++, food: '', amount: '' };
+}
+
+function addImageRow() {
+    imageRows.push({ id: imageRowIdSeed++, imageData: '', foodRows: [createFoodRow()] });
+    renderMealRows();
+}
+
+function removeImageRow(imageRowId) {
+    imageRows = imageRows.filter(r => r.id !== imageRowId);
+    renderMealRows();
+}
+
+function addFoodDetailRow(imageRowId) {
+    const row = imageRows.find(r => r.id === imageRowId);
+    if (!row) return;
+    row.foodRows.push(createFoodRow());
+    renderMealRows();
+}
+
+function removeFoodDetailRow(imageRowId, foodRowId) {
+    const row = imageRows.find(r => r.id === imageRowId);
+    if (!row) return;
+    row.foodRows = row.foodRows.filter(fr => fr.id !== foodRowId);
+    if (row.foodRows.length === 0) row.foodRows.push(createFoodRow());
+    renderMealRows();
+}
+
+function updateFoodField(imageRowId, foodRowId, field, value) {
+    const row = imageRows.find(r => r.id === imageRowId);
+    if (!row) return;
+    const foodRow = row.foodRows.find(fr => fr.id === foodRowId);
+    if (!foodRow) return;
+    foodRow[field] = value;
+}
+
+function handleImageInputChange(input, imageRowId) {
+    const row = imageRows.find(r => r.id === imageRowId);
+    if (!row) return;
+
+    const file = input.files && input.files[0];
+    if (!file) return;
+
+    pendingImageProcesses += 1;
+
+    compressImageFile(file, 960, 960, 0.68, 380000)
+        .then(function(dataUrl) {
+            row.imageData = dataUrl;
+            renderMealRows();
+        })
+        .catch(function(err) {
+            console.error('Image compression failed, fallback to original file:', err);
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                row.imageData = e.target.result;
+                renderMealRows();
+            };
+            reader.readAsDataURL(file);
+        })
+        .finally(function() {
+            pendingImageProcesses = Math.max(0, pendingImageProcesses - 1);
+        });
+}
+
+function compressImageFile(file, maxWidth, maxHeight, quality, targetMaxLength) {
+    return new Promise(function(resolve, reject) {
+        const reader = new FileReader();
+        reader.onerror = reject;
+        reader.onload = function(e) {
+            const img = new Image();
+            img.onerror = reject;
+            img.onload = function() {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return reject(new Error('Canvas context unavailable'));
+
+                let targetW = img.width;
+                let targetH = img.height;
+                let scale = Math.min(maxWidth / targetW, maxHeight / targetH, 1);
+                targetW = Math.max(1, Math.round(targetW * scale));
+                targetH = Math.max(1, Math.round(targetH * scale));
+
+                const renderAtSize = function(w, h) {
+                    canvas.width = w;
+                    canvas.height = h;
+                    ctx.clearRect(0, 0, w, h);
+                    ctx.drawImage(img, 0, 0, w, h);
+                };
+
+                renderAtSize(targetW, targetH);
+
+                // Prefer WebP for much smaller payloads; fallback to JPEG if needed.
+                let out = canvas.toDataURL('image/webp', quality);
+                let q = quality;
+                while (out.length > targetMaxLength && q > 0.4) {
+                    q -= 0.08;
+                    out = canvas.toDataURL('image/webp', q);
+                }
+
+                while (out.length > targetMaxLength && targetW > 480 && targetH > 480) {
+                    targetW = Math.round(targetW * 0.86);
+                    targetH = Math.round(targetH * 0.86);
+                    renderAtSize(targetW, targetH);
+                    q = Math.min(q, 0.58);
+                    out = canvas.toDataURL('image/webp', q);
+                }
+
+                if (out.length > targetMaxLength) {
+                    // Final fallback for compatibility/size balance.
+                    out = canvas.toDataURL('image/jpeg', 0.55);
+                }
+
+                resolve(out);
+            };
+            img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+function renderMealRows() {
+    const tbody = document.getElementById('mealRowsBody');
+    if (!tbody) return;
+
+    if (imageRows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; color:#666; padding:16px;">尚未添加圖片列</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = imageRows.map(function(row) {
+        const previewHtml = row.imageData
+            ? `<img src="${row.imageData}" alt="食物圖片" class="meal-image-preview">`
+            : '<div class="meal-image-placeholder">未上傳</div>';
+
+        const foodRowsHtml = row.foodRows.map(function(fr) {
+            return `
+                <tr>
+                    <td>
+                        <input type="text" value="${escapeHtml(fr.food)}" oninput="updateFoodField(${row.id}, ${fr.id}, 'food', this.value)" placeholder="例如：白飯、煎蛋、奶茶" class="food-cell-input">
+                    </td>
+                    <td>
+                        <input type="text" value="${escapeHtml(fr.amount)}" oninput="updateFoodField(${row.id}, ${fr.id}, 'amount', this.value)" placeholder="例如：半碗、1份、300ml" class="food-cell-input">
+                    </td>
+                    <td style="width: 74px; text-align:center;">
+                        <button type="button" class="mini-btn mini-btn-danger" onclick="removeFoodDetailRow(${row.id}, ${fr.id})">刪除</button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+
+        return `
+            <tr>
+                <td>
+                    <div class="meal-image-cell">
+                        ${previewHtml}
+                        <input type="file" class="meal-file-input" accept="image/*" onchange="handleImageInputChange(this, ${row.id})">
+                    </div>
+                </td>
+                <td>
+                    <table class="inner-food-table">
+                        <thead>
+                            <tr><th>食物</th><th>份量</th><th>操作</th></tr>
+                        </thead>
+                        <tbody>${foodRowsHtml}</tbody>
+                    </table>
+                    <button type="button" class="mini-btn mini-btn-primary" onclick="addFoodDetailRow(${row.id})">+ 新增食物列</button>
+                </td>
+                <td style="vertical-align: top;">
+                    <button type="button" class="mini-btn mini-btn-danger" onclick="removeImageRow(${row.id})">刪除此列</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function buildPhotoDescription(row) {
+    return row.foodRows
+        .filter(fr => fr.food.trim() || fr.amount.trim())
+        .map(fr => `食物：${fr.food.trim() || '(未填)'}；份量：${fr.amount.trim() || '(未填)'}`)
+        .join('\n');
+}
+
+function parsePhotoDescriptionToFoodRows(description) {
+    const lines = String(description || '').split('\n').map(s => s.trim()).filter(Boolean);
+    const rows = [];
+
+    lines.forEach(function(line) {
+        const match = line.match(/^食物：(.*?)[；;]份量：(.*)$/);
+        if (match) {
+            rows.push({ id: editFoodRowIdSeed++, food: (match[1] || '').trim(), amount: (match[2] || '').trim() });
+        } else {
+            rows.push({ id: editFoodRowIdSeed++, food: line, amount: '' });
+        }
+    });
+
+    if (!rows.length) rows.push({ id: editFoodRowIdSeed++, food: '', amount: '' });
+    return rows;
+}
+
+function ensureEditingDraftPhotos() {
+    if (!editingMealDraft) return;
+    if (!Array.isArray(editingMealDraft.photos)) editingMealDraft.photos = [];
+    if (!editingMealDraft.photos.length) {
+        editingMealDraft.photos.push({
+            id: editPhotoRowIdSeed++,
+            photo_data: '',
+            foodRows: [{ id: editFoodRowIdSeed++, food: '', amount: '' }]
+        });
     }
 }
 
-// Load user info from localStorage
-function loadUserInfoFromStorage() {
-    const savedInfo = localStorage.getItem('userInfo');
-    if (savedInfo) {
-        try {
-            const userInfo = JSON.parse(savedInfo);
-            if (userInfo.name) document.getElementById('name').value = userInfo.name;
-            if (userInfo.participantId) document.getElementById('participantId').value = userInfo.participantId;
-            if (userInfo.gender) {
-                const genderRadio = document.querySelector(`input[name="gender"][value="${userInfo.gender}"]`);
-                if (genderRadio) genderRadio.checked = true;
+function buildInlineMealPhotoEditorHtml() {
+    ensureEditingDraftPhotos();
+    if (!editingMealDraft || !editingMealDraft.photos) return '';
+
+    const rowsHtml = editingMealDraft.photos.map(function(photo) {
+        const foodRowsHtml = (photo.foodRows || []).map(function(fr) {
+            return `
+                <tr>
+                    <td><input type="text" value="${escapeHtml(fr.food || '')}" oninput="updateMealEditFoodField(${photo.id}, ${fr.id}, 'food', this.value)" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:6px;"></td>
+                    <td><input type="text" value="${escapeHtml(fr.amount || '')}" oninput="updateMealEditFoodField(${photo.id}, ${fr.id}, 'amount', this.value)" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:6px;"></td>
+                    <td style="width:64px;"><button type="button" class="mini-btn mini-btn-danger" onclick="removeMealEditFoodRow(${photo.id}, ${fr.id})">刪除</button></td>
+                </tr>
+            `;
+        }).join('');
+
+        return `
+            <div style="border:1px solid #e2e8f0; border-radius:8px; padding:8px; margin-bottom:8px;">
+                <div style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap;">
+                    <div style="width:140px; min-width:140px;">
+                        ${photo.photo_data ? `<img src="${photo.photo_data}" alt="食物照片" style="width:140px; border-radius:8px; border:1px solid #ddd;">` : '<div style="width:140px; height:105px; border:1px dashed #cbd5e1; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#64748b; font-size:12px;">未上傳</div>'}
+                        <input type="file" class="meal-file-input" accept="image/*" onchange="handleMealEditImageInputChange(this, ${photo.id})" style="margin-top:6px; width:140px;">
+                    </div>
+                    <div style="flex:1; min-width:260px;">
+                        <table style="width:100%; border-collapse:collapse;">
+                            <thead>
+                                <tr>
+                                    <th style="text-align:left; font-size:12px; color:#475569;">食物</th>
+                                    <th style="text-align:left; font-size:12px; color:#475569;">份量</th>
+                                    <th style="text-align:left; font-size:12px; color:#475569;">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>${foodRowsHtml}</tbody>
+                        </table>
+                        <div style="display:flex; gap:8px; margin-top:6px;">
+                            <button type="button" class="mini-btn mini-btn-primary" onclick="addMealEditFoodRow(${photo.id})">+ 新增食物列</button>
+                            <button type="button" class="mini-btn mini-btn-danger" onclick="removeMealEditPhotoRow(${photo.id})">刪除此照片列</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    return `
+        <div>
+            <label style="font-size:12px; color:#475569;">圖片與食物描述</label>
+            <div style="margin-top:6px;">${rowsHtml}</div>
+            <button type="button" class="mini-btn mini-btn-primary" onclick="addMealEditPhotoRow()">+ 新增圖片列</button>
+        </div>
+    `;
+}
+
+function confirmMealDate() {
+    const selectedRadio = document.querySelector('input[name="recordDate"]:checked');
+    if (!selectedRadio) {
+        alert('請選擇記錄日期');
+        return;
+    }
+
+    selectedDate = selectedRadio.value;
+    selectedDateLabel = recordDateLabels[selectedDate] || selectedDate;
+
+    document.getElementById('dateSection').style.display = 'none';
+    document.getElementById('mealEntrySection').style.display = 'block';
+    document.getElementById('mealListSection').style.display = 'block';
+    document.getElementById('mealEntryTitle').textContent = `添加${selectedDateLabel}的飲食記錄`;
+    updateMealTypeAvailability([]);
+
+    if (imageRows.length === 0) addImageRow();
+    loadMealRecords();
+}
+
+function normalizeMealTime(rawValue) {
+    const v = (rawValue || '').trim();
+    if (!v) return '';
+    const match = v.match(/^(\d{1,2}):(\d{2})$/);
+    if (!match) return null;
+    const hh = Number(match[1]);
+    const mm = Number(match[2]);
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+    return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+function getMealTimeValue() {
+    const picker = document.getElementById('mealTimePicker');
+    const text = document.getElementById('mealTimeText');
+    const pickerValue = picker ? picker.value : '';
+    const textValue = text ? text.value : '';
+    return normalizeMealTime((textValue || pickerValue || '').trim());
+}
+
+function setCurrentMealTime() {
+    const picker = document.getElementById('mealTimePicker');
+    if (!picker) return;
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    picker.value = `${hh}:${mm}`;
+}
+
+function saveMealRecord() {
+    const saveBtn = document.getElementById('saveMealBtn');
+    const originalBtnText = saveBtn ? saveBtn.textContent : '';
+
+    function setSavingState(saving) {
+        if (!saveBtn) return;
+        saveBtn.disabled = saving;
+        saveBtn.style.opacity = saving ? '0.7' : '1';
+        saveBtn.style.cursor = saving ? 'wait' : 'pointer';
+        saveBtn.textContent = saving ? '保存中...' : originalBtnText;
+    }
+
+    try {
+        if (!selectedDate) {
+            alert('請先選擇記錄日期');
+            return;
+        }
+
+        if (pendingImageProcesses > 0) {
+            alert('圖片仍在處理中，請稍候再保存');
+            return;
+        }
+
+        const mealType = document.getElementById('mealType').value;
+        const mealTime = getMealTimeValue();
+        const mealLocation = document.getElementById('mealLocation').value;
+        const mealAmount = document.getElementById('mealAmount').value;
+        const additionalDescription = document.getElementById('additionalDescription').value.trim();
+
+        if (!mealType) {
+            alert('請選擇餐次');
+            return;
+        }
+        if (mealTime === null) {
+            alert('用餐時間請使用 HH:MM（例如 08:30）');
+            return;
+        }
+        if (imageRows.length === 0) {
+            alert('請至少添加一列圖片與描述');
+            return;
+        }
+
+        const photos = [];
+        for (const row of imageRows) {
+            if (!row.imageData) {
+                alert('每一列都需要上傳圖片');
+                return;
             }
-            if (userInfo.age) document.getElementById('age').value = userInfo.age;
-        } catch (e) {
-            console.error('Error loading user info:', e);
+            const description = buildPhotoDescription(row);
+            if (!description) {
+                alert('每張圖片請至少填寫一項食物或份量');
+                return;
+            }
+            photos.push({ photo_data: row.imageData, description: description });
+        }
+
+        const payload = {
+            record_date: selectedDate,
+            record_date_label: selectedDateLabel,
+            meal_type: mealType,
+            meal_time: mealTime,
+            location: mealLocation,
+            eating_amount: mealAmount,
+            additional_description: additionalDescription,
+            is_snack: false,
+            snack_type: '',
+            snack_name: '',
+            snack_amount: '',
+            photos: photos
+        };
+
+        const payloadLength = JSON.stringify(payload).length;
+        if (payloadLength > 2_200_000) {
+            alert('本次上傳資料過大，請減少圖片數量或重新上傳圖片後再試');
+            return;
+        }
+
+        setSavingState(true);
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+        fetch('/api/save-meal-record', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+        })
+            .then(r => r.json())
+            .then(result => {
+                clearTimeout(timeoutId);
+                if (!result.success) {
+                    alert('保存失敗：' + (result.message || '未知錯誤'));
+                    setSavingState(false);
+                    return;
+                }
+                const viewParams = new URLSearchParams({
+                    mode: 'view',
+                    record_date: selectedDate || '',
+                    record_date_label: selectedDateLabel || '',
+                    real_date: selectedRealDate || ''
+                });
+                window.location.href = `/form?${viewParams.toString()}`;
+            })
+            .catch(err => {
+                clearTimeout(timeoutId);
+                console.error('Save meal record error:', err);
+                if (err && err.name === 'AbortError') {
+                    alert('保存超時，請減少圖片數量或重試');
+                } else {
+                    alert('保存失敗，請稍後重試');
+                }
+                setSavingState(false);
+            });
+    } catch (error) {
+        console.error('Unexpected save meal record error:', error);
+        alert('添加記錄時發生錯誤，請重新整理後再試');
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.style.opacity = '1';
+            saveBtn.style.cursor = 'pointer';
+            saveBtn.textContent = originalBtnText;
         }
     }
 }
 
-// Save selected date to localStorage
-function saveSelectedDate() {
-    const selectedDate = document.querySelector('input[name="recordDate"]:checked')?.value;
+function loadMealRecords() {
+    if (!selectedDate) return;
+    fetch(`/api/get-meal-records?record_date=${encodeURIComponent(selectedDate)}`)
+        .then(r => r.json())
+        .then(result => {
+            if (!result.success) {
+                const msg = result.message || '讀取失敗';
+                document.getElementById('mealItems').innerHTML = `<p style="color:#b91c1c; font-size:14px;">${escapeHtml(msg)}</p>`;
+                updateMealTypeAvailability([]);
+                return;
+            }
+            currentMealBundles = result.records || [];
+            updateMealTypeAvailability(currentMealBundles);
+            renderMealList(result.records || [], pageMode === 'view');
+        })
+        .catch(err => {
+            console.error('Load meal records error:', err);
+            document.getElementById('mealItems').innerHTML = '<p style="color:#b91c1c; font-size:14px;">讀取失敗，請稍後重試</p>';
+            updateMealTypeAvailability([]);
+        });
+}
+
+function updateMealTypeAvailability(records) {
+    const mealTypeSelect = document.getElementById('mealType');
+    if (!mealTypeSelect) return;
+
+    const takenMealTypes = new Set((records || []).map(function(bundle) {
+        return bundle && bundle.meal_record ? bundle.meal_record.meal_type : '';
+    }).filter(Boolean));
+
+    Array.from(mealTypeSelect.options).forEach(function(opt) {
+        if (!opt.value) return;
+
+        const baseLabel = opt.dataset.baseLabel || opt.textContent.replace('（已記錄）', '');
+        opt.dataset.baseLabel = baseLabel;
+
+        const isTaken = takenMealTypes.has(opt.value);
+        opt.disabled = isTaken;
+        opt.style.color = isTaken ? '#9ca3af' : '';
+        opt.textContent = isTaken ? `${baseLabel}（已記錄）` : baseLabel;
+    });
+
+    if (mealTypeSelect.value && takenMealTypes.has(mealTypeSelect.value)) {
+        mealTypeSelect.value = '';
+    }
+}
+
+function getSelectedDayDateText() {
+    const dateText = selectedRealDate ? `（${selectedRealDate}）` : '';
+    return `${selectedDateLabel || selectedDate || ''}${dateText}`;
+}
+
+function mealTimeToMinutes(mealTime) {
+    const raw = String(mealTime || '').trim();
+    if (!raw) return Number.POSITIVE_INFINITY;
+    const timePart = raw.slice(0, 5);
+    const match = timePart.match(/^(\d{1,2}):(\d{2})$/);
+    if (!match) return Number.POSITIVE_INFINITY;
+    const hh = Number(match[1]);
+    const mm = Number(match[2]);
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return Number.POSITIVE_INFINITY;
+    return hh * 60 + mm;
+}
+
+function renderMealList(records, showActions) {
+    const container = document.getElementById('mealItems');
+    const title = document.getElementById('mealListTitle');
+    if (!container) return;
+
+    const sortedRecords = [...(records || [])].sort(function(a, b) {
+        const aRecord = a && a.meal_record ? a.meal_record : {};
+        const bRecord = b && b.meal_record ? b.meal_record : {};
+        const aMinutes = mealTimeToMinutes(aRecord.meal_time);
+        const bMinutes = mealTimeToMinutes(bRecord.meal_time);
+        if (aMinutes !== bMinutes) return aMinutes - bMinutes;
+        return Number(aRecord.id || 0) - Number(bRecord.id || 0);
+    });
+
+    if (title) {
+        const dayDateText = getSelectedDayDateText();
+        title.textContent = dayDateText ? `${dayDateText}的飲食記錄` : '飲食記錄';
+    }
+
+    if (!sortedRecords.length) {
+        container.innerHTML = '<p style="color:#999; font-size:14px;">暫無記錄</p>';
+        return;
+    }
+
+    const dayDateText = getSelectedDayDateText();
+
+    container.innerHTML = sortedRecords.map(function(bundle, idx) {
+        const record = bundle.meal_record || {};
+        const photos = bundle.photos || [];
+        const isEditing = showActions && editingMealRecordId === record.id;
+
+        const photosHtml = photos.map(function(p) {
+            return `
+                <div style="display:flex; gap:10px; margin-top:8px; align-items:flex-start; flex-wrap:wrap;">
+                    <img src="${p.photo_data || ''}" alt="食物照片" style="width:140px; border-radius:8px; border:1px solid #ddd;">
+                    <div style="flex:1; min-width:220px; white-space:pre-wrap; color:#555;">${escapeHtml(p.description || '')}</div>
+                </div>
+            `;
+        }).join('');
+
+        const editFormHtml = isEditing
+            ? `
+                <div style="margin-top:10px; padding:10px; border:1px dashed #cbd5e1; border-radius:8px; background:#fff; display:grid; gap:8px;">
+                    <div>
+                        <label style="font-size:12px; color:#475569;">餐次</label>
+                        <select onchange="updateMealEditField('meal_type', this.value)" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px;">
+                            ${buildSelectOptions(['早餐','上午加餐','午餐','下午加餐','晚餐','晚上加餐'], editingMealDraft ? editingMealDraft.meal_type : record.meal_type)}
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px; color:#475569;">用餐時間</label>
+                        <input type="time" value="${escapeHtml((editingMealDraft ? editingMealDraft.meal_time : (record.meal_time || '')) || '')}" onchange="updateMealEditField('meal_time', this.value)" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px;">
+                    </div>
+                    <div>
+                        <label style="font-size:12px; color:#475569;">用餐地點</label>
+                        <select onchange="updateMealEditField('location', this.value)" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px;">
+                            ${buildSelectOptions(['家','工作單位','餐廳/外賣','其他'], editingMealDraft ? editingMealDraft.location : record.location)}
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px; color:#475569;">進食情況</label>
+                        <select onchange="updateMealEditField('eating_amount', this.value)" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px;">
+                            ${buildSelectOptions(['全部吃完','剩餘一些','只吃少量'], editingMealDraft ? editingMealDraft.eating_amount : record.eating_amount)}
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px; color:#475569;">補充描述</label>
+                        <textarea rows="2" oninput="updateMealEditField('additional_description', this.value)" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:6px; resize:vertical;">${escapeHtml((editingMealDraft ? editingMealDraft.additional_description : (record.additional_description || '')) || '')}</textarea>
+                    </div>
+                    ${buildInlineMealPhotoEditorHtml()}
+                    <div style="display:flex; gap:8px;">
+                        <button type="button" class="mini-btn mini-btn-primary" onclick="saveInlineMealEdit(${record.id})">保存</button>
+                        <button type="button" class="mini-btn" style="background:#9ca3af; color:white;" onclick="cancelInlineMealEdit()">取消</button>
+                    </div>
+                </div>
+            `
+            : '';
+
+        const actionHtml = showActions
+            ? `
+                <div style="display:flex; gap:8px; margin-top:10px;">
+                    <button type="button" class="mini-btn mini-btn-primary" onclick="startInlineMealEdit(${record.id})">${isEditing ? '編輯中' : '編輯'}</button>
+                    <button class="mini-btn mini-btn-danger" onclick="deleteMealRecord(${record.id})">刪除</button>
+                </div>
+            `
+            : '';
+
+        const readOnlyCardHtml = `
+            <div style="font-weight:700; color:var(--text); margin-bottom:6px;">${idx + 1}. ${record.meal_type || '(未填)'}</div>
+            <div style="font-size:13px; color:#666;">記錄日期：${dayDateText || '(未填)'}</div>
+            <div style="font-size:13px; color:#666;">用餐時間：${record.meal_time || '(未填)'}</div>
+            <div style="font-size:13px; color:#666;">用餐地點：${record.location || '(未填)'}</div>
+            <div style="font-size:13px; color:#666;">進食情況：${record.eating_amount || '(未填)'}</div>
+            <div style="font-size:13px; color:#666; margin-top:6px; white-space:pre-wrap;">補充描述：${escapeHtml(record.additional_description || '(無)')}</div>
+            <div style="margin-top:8px;">${photosHtml || '<span style="color:#999;">無圖片</span>'}</div>
+            ${actionHtml}
+        `;
+
+        const editingCardHtml = `
+            <div style="font-weight:700; color:var(--text); margin-bottom:6px;">${idx + 1}. 編輯餐次記錄</div>
+            ${editFormHtml}
+        `;
+
+        return `
+            <div style="border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:12px; background:#fafafa;">
+                ${isEditing ? editingCardHtml : readOnlyCardHtml}
+            </div>
+        `;
+    }).join('');
+}
+
+function buildSelectOptions(options, selectedValue) {
+    const selected = selectedValue || '';
+    const optionItems = ['<option value="">請選擇</option>'];
+    options.forEach(function(opt) {
+        const isSelected = opt === selected ? ' selected' : '';
+        optionItems.push(`<option value="${escapeHtml(opt)}"${isSelected}>${escapeHtml(opt)}</option>`);
+    });
+    return optionItems.join('');
+}
+
+function startInlineMealEdit(id) {
+    const bundle = currentMealBundles.find(function(b) {
+        return b && b.meal_record && b.meal_record.id === id;
+    });
+    if (!bundle || !bundle.meal_record) return;
+
+    const r = bundle.meal_record;
+    const photos = Array.isArray(bundle.photos) ? bundle.photos : [];
+    editingMealRecordId = id;
+    editingMealDraft = {
+        meal_type: r.meal_type || '',
+        meal_time: r.meal_time || '',
+        location: r.location || '',
+        eating_amount: r.eating_amount || '',
+        additional_description: r.additional_description || '',
+        photos: photos.map(function(p) {
+            return {
+                id: editPhotoRowIdSeed++,
+                photo_data: p.photo_data || '',
+                foodRows: parsePhotoDescriptionToFoodRows(p.description || '')
+            };
+        })
+    };
+    ensureEditingDraftPhotos();
+    renderMealList(currentMealBundles, pageMode === 'view');
+}
+
+function cancelInlineMealEdit() {
+    editingMealRecordId = null;
+    editingMealDraft = null;
+    renderMealList(currentMealBundles, pageMode === 'view');
+}
+
+function updateMealEditField(field, value) {
+    if (!editingMealDraft) return;
+    editingMealDraft[field] = value;
+}
+
+function addMealEditPhotoRow() {
+    if (!editingMealDraft) return;
+    ensureEditingDraftPhotos();
+    editingMealDraft.photos.push({
+        id: editPhotoRowIdSeed++,
+        photo_data: '',
+        foodRows: [{ id: editFoodRowIdSeed++, food: '', amount: '' }]
+    });
+    renderMealList(currentMealBundles, pageMode === 'view');
+}
+
+function removeMealEditPhotoRow(photoRowId) {
+    if (!editingMealDraft || !Array.isArray(editingMealDraft.photos)) return;
+    editingMealDraft.photos = editingMealDraft.photos.filter(function(p) { return p.id !== photoRowId; });
+    ensureEditingDraftPhotos();
+    renderMealList(currentMealBundles, pageMode === 'view');
+}
+
+function addMealEditFoodRow(photoRowId) {
+    if (!editingMealDraft || !Array.isArray(editingMealDraft.photos)) return;
+    const row = editingMealDraft.photos.find(function(p) { return p.id === photoRowId; });
+    if (!row) return;
+    if (!Array.isArray(row.foodRows)) row.foodRows = [];
+    row.foodRows.push({ id: editFoodRowIdSeed++, food: '', amount: '' });
+    renderMealList(currentMealBundles, pageMode === 'view');
+}
+
+function removeMealEditFoodRow(photoRowId, foodRowId) {
+    if (!editingMealDraft || !Array.isArray(editingMealDraft.photos)) return;
+    const row = editingMealDraft.photos.find(function(p) { return p.id === photoRowId; });
+    if (!row || !Array.isArray(row.foodRows)) return;
+    row.foodRows = row.foodRows.filter(function(fr) { return fr.id !== foodRowId; });
+    if (!row.foodRows.length) row.foodRows.push({ id: editFoodRowIdSeed++, food: '', amount: '' });
+    renderMealList(currentMealBundles, pageMode === 'view');
+}
+
+function updateMealEditFoodField(photoRowId, foodRowId, field, value) {
+    if (!editingMealDraft || !Array.isArray(editingMealDraft.photos)) return;
+    const row = editingMealDraft.photos.find(function(p) { return p.id === photoRowId; });
+    if (!row || !Array.isArray(row.foodRows)) return;
+    const fr = row.foodRows.find(function(item) { return item.id === foodRowId; });
+    if (!fr) return;
+    fr[field] = value;
+}
+
+function handleMealEditImageInputChange(input, photoRowId) {
+    if (!editingMealDraft || !Array.isArray(editingMealDraft.photos)) return;
+    const row = editingMealDraft.photos.find(function(p) { return p.id === photoRowId; });
+    if (!row) return;
+
+    const file = input.files && input.files[0];
+    if (!file) return;
+
+    pendingImageProcesses += 1;
+    compressImageFile(file, 960, 960, 0.68, 380000)
+        .then(function(dataUrl) {
+            row.photo_data = dataUrl;
+            renderMealList(currentMealBundles, pageMode === 'view');
+        })
+        .catch(function(err) {
+            console.error('Edit image compression failed, fallback to original:', err);
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                row.photo_data = e.target.result;
+                renderMealList(currentMealBundles, pageMode === 'view');
+            };
+            reader.readAsDataURL(file);
+        })
+        .finally(function() {
+            pendingImageProcesses = Math.max(0, pendingImageProcesses - 1);
+        });
+}
+
+function saveInlineMealEdit(id) {
+    if (!editingMealDraft) return;
+
+    if (pendingImageProcesses > 0) {
+        alert('圖片仍在處理中，請稍候再保存');
+        return;
+    }
+
+    const normalizedMealTime = normalizeMealTime(editingMealDraft.meal_time || '');
+    if (normalizedMealTime === null) {
+        alert('用餐時間請使用 HH:MM（例如 08:30）');
+        return;
+    }
+    if (!editingMealDraft.meal_type) {
+        alert('請選擇餐次');
+        return;
+    }
+
+    ensureEditingDraftPhotos();
+    const editPhotos = [];
+    for (const p of editingMealDraft.photos) {
+        if (!p.photo_data) {
+            alert('每一列都需要上傳圖片');
+            return;
+        }
+        const description = buildPhotoDescription(p);
+        if (!description) {
+            alert('每張圖片請至少填寫一項食物或份量');
+            return;
+        }
+        editPhotos.push({ photo_data: p.photo_data, description: description });
+    }
+
+    fetch(`/api/update-meal-record/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            meal_type: editingMealDraft.meal_type,
+            meal_time: normalizedMealTime,
+            location: editingMealDraft.location,
+            eating_amount: editingMealDraft.eating_amount,
+            additional_description: editingMealDraft.additional_description,
+            photos: editPhotos
+        })
+    })
+        .then(r => r.json())
+        .then(result => {
+            if (!result.success) {
+                alert('更新失敗：' + (result.message || '未知錯誤'));
+                return;
+            }
+            editingMealRecordId = null;
+            editingMealDraft = null;
+            loadMealRecords();
+        })
+        .catch(err => {
+            console.error('Update meal record error:', err);
+            alert('更新失敗');
+        });
+}
+
+function deleteMealRecord(id) {
+    if (!confirm('確定要刪除這筆飲食記錄嗎？')) return;
+
+    fetch(`/api/delete-meal-record/${id}`, { method: 'DELETE' })
+        .then(r => r.json())
+        .then(result => {
+            if (!result.success) {
+                alert('刪除失敗：' + (result.message || '未知錯誤'));
+                return;
+            }
+            loadMealRecords();
+        })
+        .catch(err => {
+            console.error('Delete meal record error:', err);
+            alert('刪除失敗');
+        });
+}
+
+function resetMealForm() {
+    imageRows = [];
+    document.getElementById('mealType').value = '';
+    document.getElementById('mealTimePicker').value = '';
+    const mealTimeText = document.getElementById('mealTimeText');
+    if (mealTimeText) mealTimeText.value = '';
+    document.getElementById('mealLocation').value = '';
+    document.getElementById('mealAmount').value = '';
+    document.getElementById('additionalDescription').value = '';
+    addImageRow();
+}
+
+function finishMealDay() {
+    if (!selectedDate) {
+        alert('請先選擇記錄日期');
+        return;
+    }
+
+    if (!confirm('確定完成今日飲食記錄嗎？')) return;
+
+    fetch('/api/complete-daily-record', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ record_date: selectedDate })
+    })
+        .then(r => r.json())
+        .then(result => {
+            if (!result.success) {
+                alert('完成失敗：' + (result.message || '未知錯誤'));
+                return;
+            }
+            alert('今日飲食記錄已完成');
+        })
+        .catch(err => {
+            console.error('Complete daily record error:', err);
+            alert('操作失敗，請稍後重試');
+        });
+}
+
+function initPageMode() {
+    const params = getQueryParams();
+    const mode = params.get('mode') || 'add';
+    pageMode = mode;
+    selectedDate = params.get('record_date') || '';
+    selectedDateLabel = params.get('record_date_label') || (recordDateLabels[selectedDate] || '');
+    selectedRealDate = params.get('real_date') || '';
+
+    if (mode === 'view') {
+        document.getElementById('dateSection').style.display = 'none';
+        document.getElementById('mealEntrySection').style.display = 'none';
+        document.getElementById('mealListSection').style.display = 'block';
+        const title = document.getElementById('mealListTitle');
+        if (title) {
+            const realDateText = selectedRealDate ? `（${selectedRealDate}）` : '';
+            title.textContent = `${selectedDateLabel || selectedDate}${realDateText}的飲食記錄`;
+        }
+        loadMealRecords();
+        return;
+    }
+
     if (selectedDate) {
-        localStorage.setItem('selectedRecordDate', selectedDate);
+        document.getElementById('dateSection').style.display = 'none';
+        document.getElementById('mealEntrySection').style.display = 'block';
+        document.getElementById('mealListSection').style.display = 'block';
+        const realDateText = selectedRealDate ? `（${selectedRealDate}）` : '';
+        document.getElementById('mealEntryTitle').textContent = `添加${selectedDateLabel}${realDateText}的飲食記錄`;
+        addImageRow();
+        loadMealRecords();
     }
 }
 
-// Load selected date from localStorage
-function loadSelectedDate() {
-    const savedDate = localStorage.getItem('selectedRecordDate');
-    if (savedDate) {
-        const dateRadio = document.querySelector(`input[name="recordDate"][value="${savedDate}"]`);
-        if (dateRadio && !document.querySelector('input[name="recordDate"]:checked')) {
-            dateRadio.checked = true;
+function setupMealTimeInputs() {
+    const picker = document.getElementById('mealTimePicker');
+    const text = document.getElementById('mealTimeText');
+    if (!picker) return;
+
+    picker.addEventListener('change', function() {
+        if (text && picker.value) {
+            text.value = picker.value;
         }
+    });
+
+    if (text) {
+        text.addEventListener('blur', function() {
+            const normalized = normalizeMealTime(text.value);
+            if (normalized) {
+                text.value = normalized;
+                picker.value = normalized;
+            }
+        });
     }
 }
 
-// Go to exercise tracking page
-function goToExerciseTracking() {
-    saveUserInfoToStorage();
-    saveSelectedDate();
-    window.location.href = 'exercise.html';
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
-// Handle skipping step 4 (no additional description needed)
-function skipStep4() {
-    // Optionally, you can set a flag or update mealData to indicate no extra description
-    if (typeof mealData !== 'undefined') {
-        mealData.additionalDesc = '無';
-    }
-    // Disable input for step 4
-    const chatInput = document.getElementById('chatInput');
-    const chatSend = document.getElementById('chatSend');
-    if (chatInput && chatSend) {
-        chatInput.value = '';
-        chatInput.disabled = true;
-        chatSend.disabled = true;
-        chatInput.placeholder = '輸入訊息...';
-    }
-    // Remove any temporary event listeners for step 4
-    if (typeof step4Temp !== 'undefined' && step4Temp.handler && chatSend && chatInput) {
-        chatSend.removeEventListener('click', step4Temp.handler);
-        chatInput.removeEventListener('keypress', step4Temp.keyHandler);
-        step4Active = false;
-    }
-    // Always show editable time input for main meals in summary bubble
-    if (summaryBubbleShown) return; // avoid duplicate summary bubbles
-    summaryBubbleShown = true;
-    // Generate unique ID suffix using timestamp
-    const uniqueId = Date.now();
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.setAttribute('data-summary-id', uniqueId);
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>記錄摘要：</strong><br><br>
-            <strong>記錄日期：</strong>${getRecordDateLabel()}<br>
-            <strong>餐次：</strong>
-            <select id="editMealType_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                <option value="早餐" ${currentMealName === '早餐' ? 'selected' : ''}>早餐</option>
-                <option value="上午加餐" ${currentMealName === '上午加餐' ? 'selected' : ''}>上午加餐</option>
-                <option value="午餐" ${currentMealName === '午餐' ? 'selected' : ''}>午餐</option>
-                <option value="下午加餐" ${currentMealName === '下午加餐' ? 'selected' : ''}>下午加餐</option>
-                <option value="晚餐" ${currentMealName === '晚餐' ? 'selected' : ''}>晚餐</option>
-                <option value="晚上加餐" ${currentMealName === '晚上加餐' ? 'selected' : ''}>晚上加餐</option>
-            </select><br>
-            <br><strong>已上傳照片及描述：</strong>
-            ${mealData.photos.map((photo, i) => `
-                <div style="margin:8px 0;">
-                    <img src="${photo}" alt="照片 ${i + 1}" class="uploaded-image">
-                    <br><textarea id="desc${i}_${uniqueId}" style="width: 100%; padding: 5px; border: 1px solid #ccc; border-radius: 5px; font-family: inherit; font-size: 12px;" rows="2">${mealData.descriptions[i]}</textarea>
-                </div>
-            `).join('')}
-            <strong>用餐時間：</strong><div id="editMealTimeContainer_${uniqueId}" style="display: inline-block;"></div><br>
-            <strong>用餐地點：</strong>
-            <select id="editLocation_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                <option value="家" ${mealData.location === '家' ? 'selected' : ''}>家</option>
-                <option value="工作單位" ${mealData.location === '工作單位' ? 'selected' : ''}>工作單位</option>
-                <option value="餐廳/外賣" ${mealData.location === '餐廳/外賣' ? 'selected' : ''}>餐廳/外賣</option>
-                <option value="其他" ${mealData.location === '其他' ? 'selected' : ''}>其他</option>
-            </select><br>
-            <br><strong>進食情況：</strong>
-            <select id="editAmount_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                <option value="全部吃完" ${mealData.amount === '全部吃完' ? 'selected' : ''}>全部吃完</option>
-                <option value="剩餘一些" ${mealData.amount === '剩餘一些' ? 'selected' : ''}>剩餘一些</option>
-                <option value="只吃少量" ${mealData.amount === '只吃少量' ? 'selected' : ''}>只吃少量</option>
-            </select><br>
-            <br><strong>補充描述：</strong><textarea id="editAdditionalDesc_${uniqueId}" style="width: 100%; padding: 5px; border: 1px solid #ccc; border-radius: 5px; font-family: inherit; font-size: 12px;" rows="2">${mealData.additionalDesc}</textarea><br><br>
-            <button class="submit-info-btn" onclick="finalizeRecord(${uniqueId})" style="margin-top:10px; width: 100%;">保存${currentMealName}記錄</button>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    // Always generate and insert the time dropdowns for main meal summary
-    const timeDropdowns = generateTimeDropdowns(mealData.mealTime, `editMealTime_${uniqueId}`);
-    const container = document.getElementById(`editMealTimeContainer_${uniqueId}`);
-    if (container) {
-        container.innerHTML = timeDropdowns.html;
-    }
+function escapeJs(str) {
+    return String(str).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '');
 }
 
-// Ask if user wants to upload more photos or continue
-function askMorePhotos() {
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            是否還有其他食物照片要上傳？<br>
-            <div class="upload-buttons confirm-upload-buttons" style="margin-top:10px; display: flex; gap: 16px;">
-                <button class="upload-btn" onclick="showUploadPromptNoDivider()" style="flex: 1;">再上傳一張</button>
-                <button class="submit-info-btn" onclick="noMorePhotosMainFlow()" style="flex: 1;">沒有了，繼續</button>
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Handler for "沒有了，繼續" in main meal/photo flow
-function noMorePhotosMainFlow() {
-    // Show Step 3: 補充資訊 (meal time, location, amount) with same time input as snack
-    const step3Msg = document.createElement('div');
-    step3Msg.className = 'bot-message';
-    step3Msg.innerHTML = `
-        <div class="message-content">
-            <strong>第3步：補充資訊</strong><br>
-            <div class="info-field">
-                <div>1. 用餐時間：</div>
-                <div id="mealTimeContainer"></div>
-            </div>
-            <div class="info-field">
-                <div>2. 用餐地點：</div>
-                <div style="margin-top:2px;">
-                    <label style="margin-right:10px;"><input type="radio" name="location" value="家">家</label>
-                    <label style="margin-right:10px;"><input type="radio" name="location" value="工作單位">工作單位</label>
-                    <label style="margin-right:10px;"><input type="radio" name="location" value="餐廳/外賣">餐廳/外賣</label>
-                    <label><input type="radio" name="location" value="其他">其他</label>
-                </div>
-            </div>
-            <div class="info-field">
-                <div>3. 進食情況：</div>
-                <div style="margin-top:2px;">
-                    <label style="margin-right:10px;"><input type="radio" name="amount" value="全部吃完">全部吃完</label>
-                    <label style="margin-right:10px;"><input type="radio" name="amount" value="剩餘一些">剩餘一些</label>
-                    <label><input type="radio" name="amount" value="只吃少量">只吃少量</label>
-                </div>
-            </div>
-            <button class="submit-info-btn" onclick="submitAdditionalInfo()" style="margin-top:10px; width: 100%;">送出補充資訊</button>
-        </div>
-    `;
-    chatMessagesEl.appendChild(step3Msg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    // Generate and insert the time dropdowns for meal form with a small delay to ensure DOM is ready
-    setTimeout(() => {
-        // Use empty string for time so it shows default "00:00" input fields
-        const timeDropdowns = generateTimeDropdowns('', 'mealTime');
-        // Find the LAST mealTimeContainer (for handling multiple meals in one session)
-        const containers = document.querySelectorAll('#mealTimeContainer');
-        const container = containers.length > 0 ? containers[containers.length - 1] : null;
-        if (container) {
-            container.innerHTML = timeDropdowns.html;
-        }
-    }, 100);
-}
-
-// Returns the label for the currently selected record date
-function getRecordDateLabel() {
-    const recordDateSelect = document.getElementById('recordDate');
-    if (recordDateSelect) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        return selectedOption ? selectedOption.text : recordDateSelect.value;
-    }
-    // Fallback: check radio buttons
-    const recordDateRadio = document.querySelector('input[name="recordDate"]:checked');
-    if (recordDateRadio) {
-        const label = recordDateRadio.parentElement.textContent.trim();
-        return label;
-    }
-    return '';
-}
-
-// FAQ Modal functionality
+// FAQ modal
 const modal = document.getElementById('faqModal');
 const helpBtn = document.getElementById('helpBtn');
 const closeBtn = document.querySelector('.close');
 
 if (helpBtn) {
-    helpBtn.addEventListener('click', () => {
+    helpBtn.addEventListener('click', function() {
         if (modal) modal.style.display = 'block';
     });
 }
 
 if (closeBtn) {
-    closeBtn.addEventListener('click', () => {
+    closeBtn.addEventListener('click', function() {
         if (modal) modal.style.display = 'none';
     });
 }
 
-window.addEventListener('click', (event) => {
-    if (event.target === modal) {
-        modal.style.display = 'none';
-    }
+window.addEventListener('click', function(event) {
+    if (event.target === modal) modal.style.display = 'none';
 });
 
-// Global state variables
-let chatMessagesEl, selectionStatusEl;
-let userSelectionMsgEl = null;
-let uploadPromptShown = false;
-let step4Active = false;
-let step4Temp = { answered: false, handler: null, keyHandler: null };
-let currentFlow = 'main';
-let snackType = null;
-let currentMealName = '';
-let recordedMeals = {};
-let allDailyRecords = {};
-let summaryBubbleShown = false;
-let isDateLocked = false;
-let pendingRecordOverride = null;
-let currentRecordData = {
-    mealTime: '',
-    location: '',
-    amount: ''
-};
-let mealData = {
-    photoCount: 0,
-    photos: [],
-    descriptions: [],
-    photoBatchIndices: [], // Track which images belong to which batch
-    currentBatchIndex: -1, // Current batch index
-    mealTime: '',
-    location: '',
-    amount: '',
-    additionalDesc: '',
-    snackName: '',
-    snackAmount: ''
-};
-let pendingAmountQuestions = [];
-let currentAmountQuestion = null;
-let cameraStream = null;
+window.confirmMealDate = confirmMealDate;
+window.addImageRow = addImageRow;
+window.removeImageRow = removeImageRow;
+window.addFoodDetailRow = addFoodDetailRow;
+window.removeFoodDetailRow = removeFoodDetailRow;
+window.updateFoodField = updateFoodField;
+window.handleImageInputChange = handleImageInputChange;
+window.saveMealRecord = saveMealRecord;
+window.resetMealForm = resetMealForm;
+window.finishMealDay = finishMealDay;
+window.startInlineMealEdit = startInlineMealEdit;
+window.cancelInlineMealEdit = cancelInlineMealEdit;
+window.updateMealEditField = updateMealEditField;
+window.addMealEditPhotoRow = addMealEditPhotoRow;
+window.removeMealEditPhotoRow = removeMealEditPhotoRow;
+window.addMealEditFoodRow = addMealEditFoodRow;
+window.removeMealEditFoodRow = removeMealEditFoodRow;
+window.updateMealEditFoodField = updateMealEditFoodField;
+window.handleMealEditImageInputChange = handleMealEditImageInputChange;
+window.saveInlineMealEdit = saveInlineMealEdit;
+window.deleteMealRecord = deleteMealRecord;
+window.setCurrentMealTime = setCurrentMealTime;
 
-// Initialize on DOM ready
-document.addEventListener('DOMContentLoaded', function() {
-    chatMessagesEl = document.getElementById('chatMessages');
-    selectionStatusEl = document.getElementById('mealSelectionStatus');
-    
-    // Attach listeners to static meal-option buttons (initial render)
-    document.querySelectorAll('.meal-option').forEach((btn) => {
-        btn.addEventListener('click', handleMealOptionClick);
-    });
-    
-    // Attach listener to reset button
-    const resetBtn = document.getElementById('resetBtn');
-    if (resetBtn) {
-        resetBtn.addEventListener('click', function() {
-            window.resetForm();
-        });
-    }
-
-    // Attach chat send listeners
-    const chatSend = document.getElementById('chatSend');
-    const chatInput = document.getElementById('chatInput');
-    if (chatSend) {
-        chatSend.addEventListener('click', function() {
-            if (!chatSend.disabled) {
-                if (typeof step4Active !== 'undefined' && step4Active && step4Temp && typeof step4Temp.handler === 'function') {
-                    step4Temp.handler();
-                } else {
-                    sendChatMessage();
-                }
-            }
-        });
-    }
-    if (chatInput) {
-        chatInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter' && !chatInput.disabled) {
-                if (typeof step4Active !== 'undefined' && step4Active && step4Temp && typeof step4Temp.handler === 'function') {
-                    step4Temp.handler();
-                } else {
-                    sendChatMessage();
-                }
-            }
-        });
-    }
-});
-
-// Confirm date selection and show meal options
-window.confirmDateSelection = function() {
-    const selectedDate = document.querySelector('input[name="recordDate"]:checked');
-    if (!selectedDate) {
-        alert('請選擇記錄日期');
-        return;
-    }
-    
-    // Create or update the hidden select element
-    let selectElement = document.getElementById('recordDate');
-    if (!selectElement) {
-        selectElement = document.createElement('select');
-        selectElement.id = 'recordDate';
-        selectElement.name = 'recordDate';
-        selectElement.style.display = 'none';
-        
-        const option1 = document.createElement('option');
-        option1.value = 'workday1';
-        option1.text = '第一個工作日';
-        selectElement.appendChild(option1);
-        
-        const option2 = document.createElement('option');
-        option2.value = 'workday2';
-        option2.text = '第二個工作日';
-        selectElement.appendChild(option2);
-        
-        const option3 = document.createElement('option');
-        option3.value = 'restday';
-        option3.text = '第一個休息日';
-        selectElement.appendChild(option3);
-        
-        document.body.appendChild(selectElement);
-    }
-    
-    selectElement.value = selectedDate.value;
-    showMealOptionsAfterDateSelection();
-};
-
-// Show meal options after date selection
-function showMealOptionsAfterDateSelection() {
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>請選擇您要記錄的餐次：</strong>
-            <div class="meal-options">
-                <button class="meal-option" data-value="breakfast"><strong>早餐</strong>（通常6:00-9:00）</button>
-                <button class="meal-option" data-value="snack_morning"><strong>上午加餐</strong>（9:00-11:00）</button>
-                <button class="meal-option" data-value="lunch"><strong>午餐</strong>（11:00-13:30）</button>
-                <button class="meal-option" data-value="snack_afternoon"><strong>下午加餐</strong>（14:00-17:00）</button>
-                <button class="meal-option" data-value="dinner"><strong>晚餐</strong>（17:00-20:00）</button>
-                <button class="meal-option" data-value="snack_night"><strong>晚上加餐</strong>（20:00-睡前）</button>
-            </div>
-            <div id="mealSelectionStatus" class="selection-status"></div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    selectionStatusEl = document.getElementById('mealSelectionStatus');
-    
-    document.querySelectorAll('.meal-option').forEach((btn) => {
-        btn.addEventListener('click', handleMealOptionClick);
-    });
-}
-
-// Handle meal option button click
-function handleMealOptionClick(e) {
-    const btn = e.currentTarget || this;
-    
-    if (btn.disabled || btn.classList.contains('disabled')) {
-        return;
-    }
-    
-    const recordDateSelect = document.getElementById('recordDate');
-    if (!recordDateSelect || !recordDateSelect.value) {
-        alert('請先選擇記錄日期！');
-        return;
-    }
-    
-    document.querySelectorAll('.meal-option').forEach(b => b.classList.remove('selected'));
-    btn.classList.add('selected');
-    const label = btn.textContent.trim();
-    const mealName = extractMealName(label);
-    const mealValue = btn.getAttribute('data-value');
-    
-    const selectionStatusEl = document.getElementById('mealSelectionStatus');
-    if (selectionStatusEl) selectionStatusEl.textContent = `已選擇餐次：${label}`;
-
-    if (!userSelectionMsgEl) {
-        const wrapper = document.createElement('div');
-        wrapper.className = 'user-message';
-        const content = document.createElement('div');
-        content.className = 'message-content';
-        wrapper.appendChild(content);
-        chatMessagesEl.appendChild(wrapper);
-        userSelectionMsgEl = content;
-    }
-
-    userSelectionMsgEl.textContent = `我選擇：${label}`;
-    
-    summaryBubbleShown = false;
-    uploadPromptShown = false;
-
-    if (mealValue === 'breakfast' || mealValue === 'lunch' || mealValue === 'dinner') {
-        currentFlow = 'main';
-        currentMealName = mealName;
-        if (!uploadPromptShown) {
-            setTimeout(() => showUploadPrompt(mealName), 500);
-            uploadPromptShown = true;
-        }
-    } else {
-        currentFlow = 'snack';
-        currentMealName = mealName;
-        setTimeout(() => startSnackFlow(), 300);
-    }
-    
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Extract meal name from label
-function extractMealName(label) {
-    const match = label.match(/^([^（]+)/);
-    return match ? match[1] : label;
-}
-
-// Show upload prompt for main meals
-function showUploadPrompt(mealName) {
-    const divider = document.createElement('div');
-    divider.className = 'meal-divider';
-    divider.innerHTML = `<span>${mealName}記錄</span>`;
-    chatMessagesEl.appendChild(divider);
-    
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>第1步：上傳照片</strong><br>
-            請上傳食物照片。若為包裝食品，請上傳食物包裝以及營養成分表<br>
-            <div class="upload-buttons">
-                <button class="upload-btn" onclick="openCamera()">📷 點擊拍照</button>
-                <button class="upload-btn" onclick="document.getElementById('galleryInput').click()">🖼️ 選擇照片</button>
-            </div>
-            <input type="file" id="galleryInput" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" multiple style="display:none;" onchange="handleImageUpload(event)">
-            <div class="photo-tips">
-                <strong>【拍攝提示】</strong><br>
-                • 將食物放在碗、盤或杯中拍攝<br>
-                • 確保光線充足，照片清晰<br>
-                • 包裝食品請單獨拍攝營養成分表
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Show upload prompt without divider
-function showUploadPromptNoDivider() {
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>第1步：上傳照片</strong><br>
-            請上傳食物照片。若為包裝食品，請上傳食物包裝以及營養成分表<br>
-            <div class="upload-buttons">
-                <button class="upload-btn" onclick="openCamera()">📷 點擊拍照</button>
-                <button class="upload-btn" onclick="document.getElementById('galleryInput2').click()">🖼️ 選擇照片</button>
-            </div>
-            <input type="file" id="galleryInput2" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" multiple style="display:none;" onchange="handleImageUpload(event)">
-            <div class="photo-tips">
-                <strong>【拍攝提示】</strong><br>
-                • 將食物放在碗、盤或杯中拍攝<br>
-                • 確保光線充足，照片清晰<br>
-                • 包裝食品請單獨拍攝營養成分表
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Camera functions
-window.openCamera = async function() {
-    try {
-        cameraStream = await navigator.mediaDevices.getUserMedia({ 
-            video: { facingMode: 'environment' },
-            audio: false 
-        });
-        
-        const modal = document.createElement('div');
-        modal.className = 'camera-modal';
-        modal.innerHTML = `
-            <div class="camera-container">
-                <video id="cameraVideo" autoplay playsinline></video>
-                <div class="camera-controls">
-                    <button class="camera-btn capture-btn" onclick="capturePhoto()">📷 拍照</button>
-                    <button class="camera-btn close-btn" onclick="closeCamera()">✖ 取消</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-        
-        const video = document.getElementById('cameraVideo');
-        video.srcObject = cameraStream;
-        
-    } catch (error) {
-        console.error('Camera access error:', error);
-        alert('無法訪問相機。請檢查相機權限或使用「選擇照片」功能。');
-    }
-};
-
-window.capturePhoto = function() {
-    const video = document.getElementById('cameraVideo');
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
-    
-    canvas.toBlob((blob) => {
-        const file = new File([blob], 'camera-photo.jpg', { type: 'image/jpeg' });
-        handleImageUpload({ target: { files: [file] } });
-        closeCamera();
-    }, 'image/jpeg', 0.9);
-};
-
-window.closeCamera = function() {
-    if (cameraStream) {
-        cameraStream.getTracks().forEach(track => track.stop());
-        cameraStream = null;
-    }
-    const modal = document.querySelector('.camera-modal');
-    if (modal) modal.remove();
-};
-
-// Handle image upload
-window.handleImageUpload = function(event) {
-    const files = event.target.files;
-    if (files && files.length > 0) {
-        let filesProcessed = 0;
-        const totalFiles = files.length;
-        
-        // Process each file
-        Array.from(files).forEach((file, index) => {
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                const userMsg = document.createElement('div');
-                userMsg.className = 'user-message';
-                userMsg.innerHTML = `
-                    <div class="message-content">
-                        <img src="${e.target.result}" alt="上傳的照片 ${index + 1}" class="uploaded-image">
-                    </div>
-                `;
-                chatMessagesEl.appendChild(userMsg);
-                chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-                
-                mealData.photoCount++;
-                mealData.photos.push(e.target.result);
-                
-                filesProcessed++;
-                
-                // Only show next step after all files are processed
-                if (filesProcessed === totalFiles) {
-                    setTimeout(() => {
-                        if (currentFlow === 'main') {
-                            const botMsg = document.createElement('div');
-                            botMsg.className = 'bot-message';
-                            botMsg.innerHTML = `
-                                <div class="message-content">
-                                    <strong>第2步：對上傳的食物進行文字描述</strong><br>
-                                    <span style="font-size: 13px; color: #666;">格式：食物-份量，多種食物之間用空格隔開。<br>例如：蘋果-100g 麵條-一碗 麵包-一拳</span><br>
-                                    <a href="https://mp.weixin.qq.com/s?__biz=MzI1OTAwNDMxNw==&mid=2651449890&idx=1&sn=42698ec485f0a2f62da6109e7c9cb32e&chksm=f016f88ff6fa697bdd8dd9ab3eeada5de093f505c35fda97601cc08559e2088ec09f3b7e6739&scene=27" target="_blank" style="font-size: 13px; color: var(--accent); text-decoration: underline; cursor: pointer;">常見食物的重量</a>
-                                </div>
-                            `;
-                            chatMessagesEl.appendChild(botMsg);
-                            chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-                            enableChatInput();
-                        } else if (currentFlow === 'snack') {
-                            const botMsg = document.createElement('div');
-                            botMsg.className = 'bot-message';
-                            botMsg.innerHTML = `
-                                <div class="message-content">
-                                    <strong>詳細資訊：</strong><br><br>
-                                    <div class="info-form">
-                                        <div class="info-field">
-                                            <label>1. 進食時間：</label>
-                                            <div id="snackTimeContainer"></div>
-                                        </div>
-                                        <div class="info-field">
-                                            <label>2. 食物名稱：</label>
-                                            <input type="text" id="snackName" class="text-input" placeholder="如：蘋果、餅乾、礦泉水">
-                                        </div>
-                                        <div class="info-field">
-                                            <label>3. 估計分量：</label>
-                                            <input type="text" id="snackAmount" class="text-input" placeholder="如：1個蘋果、半包餅乾">
-                                        </div>
-                                        <button class="submit-info-btn" onclick="submitSnackDetails()">提交</button>
-                                    </div>
-                                </div>
-                            `;
-                            chatMessagesEl.appendChild(botMsg);
-                            chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-                            
-                            const timeDropdowns = generateTimeDropdowns(currentRecordData.mealTime, 'snackTime');
-                            const containers = document.querySelectorAll('#snackTimeContainer');
-                            const container = containers.length > 0 ? containers[containers.length - 1] : null;
-                            if (container) {
-                                container.innerHTML = timeDropdowns.html;
-                            }
-                        }
-                    }, 500);
-                }
-            };
-            reader.readAsDataURL(file);
-        });
-    }
-};
-
-// Start snack flow
-window.startSnackFlow = function() {
-    currentFlow = 'snack';
-    snackType = null;
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>請選擇加餐類型（即使是小零食或一杯水，也請記錄下來）：</strong>
-            <div class="radio-options" style="margin-top:8px;">
-                <label class="radio-option"><input type="radio" name="snackType" value="水果"> 水果</label>
-                <label class="radio-option"><input type="radio" name="snackType" value="零食"> 零食</label>
-                <label class="radio-option"><input type="radio" name="snackType" value="飲料"> 飲料</label>
-                <label class="radio-option"><input type="radio" name="snackType" value="堅果"> 堅果</label>
-                <label class="radio-option"><input type="radio" name="snackType" value="甜品"> 甜品</label>
-                <label class="radio-option"><input type="radio" name="snackType" value="其他"> 其他</label>
-            </div>
-            <button class="submit-info-btn" onclick="submitSnackType()">下一步</button>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Submit snack type
-window.submitSnackType = function() {
-    const selected = document.querySelector('input[name="snackType"]:checked');
-    if (!selected) {
-        alert('請選擇加餐類型');
-        return;
-    }
-    snackType = selected.value;
-    const userMsg = document.createElement('div');
-    userMsg.className = 'user-message';
-    userMsg.innerHTML = `
-        <div class="message-content">我選擇：${snackType}</div>
-    `;
-    chatMessagesEl.appendChild(userMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    setTimeout(() => {
-        showSnackUploadPrompt();
-    }, 300);
-};
-
-// Show snack upload prompt
-function showSnackUploadPrompt() {
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>第1步：上傳照片</strong><br>
-            請上傳食物照片。若為包裝食品，請上傳食物包裝以及營養成分表<br>
-            <div class="upload-buttons">
-                <button class="upload-btn" onclick="openCamera()">📷 點擊拍照</button>
-                <button class="upload-btn" onclick="document.getElementById('snackGalleryInput').click()">🖼️ 選擇照片</button>
-            </div>
-            <input type="file" id="snackGalleryInput" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" multiple style="display:none;" onchange="handleImageUpload(event)">
-            <div class="photo-tips">
-                <strong>【拍攝提示】</strong><br>
-                • 將食物放在碗、盤或杯中拍攝<br>
-                • 確保光線充足，照片清晰<br>
-                • 包裝食品請單獨拍攝營養成分表
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Submit snack details
-window.submitSnackDetails = function() {
-    const timePickerInputs = document.querySelectorAll('#snackTimePicker');
-    const timePickerInput = timePickerInputs.length > 0 ? timePickerInputs[timePickerInputs.length - 1] : null;
-    const snackNameInputs = document.querySelectorAll('#snackName');
-    const snackNameInput = snackNameInputs.length > 0 ? snackNameInputs[snackNameInputs.length - 1] : null;
-    const snackAmountInputs = document.querySelectorAll('#snackAmount');
-    const snackAmountInput = snackAmountInputs.length > 0 ? snackAmountInputs[snackAmountInputs.length - 1] : null;
-    
-    const snackName = snackNameInput ? snackNameInput.value.trim() : '';
-    const snackAmount = snackAmountInput ? snackAmountInput.value.trim() : '';
-    
-    if (!timePickerInput || !timePickerInput.value || !snackName || !snackAmount) {
-        alert('請填寫所有詳細資訊');
-        return;
-    }
-    
-    const snackTime = timePickerInput.value;
-    
-    mealData.mealTime = snackTime;
-    mealData.snackName = snackName;
-    mealData.snackAmount = snackAmount;
-    
-    currentRecordData.mealTime = snackTime;
-    
-    const userMsg = document.createElement('div');
-    userMsg.className = 'user-message';
-    userMsg.innerHTML = `
-        <div class="message-content">
-            進食時間：${snackTime}<br>
-            食物名稱：${snackName}<br>
-            估計分量：${snackAmount}
-        </div>
-    `;
-    chatMessagesEl.appendChild(userMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    if (summaryBubbleShown) return;
-    summaryBubbleShown = true;
-    const uniqueId = Date.now();
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.setAttribute('data-summary-id', uniqueId);
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>記錄摘要：</strong><br><br>
-            <strong>記錄日期：</strong>${getRecordDateLabel()}<br>
-            <strong>餐次：</strong>
-            <select id="editMealType_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                <option value="早餐" ${currentMealName === '早餐' ? 'selected' : ''}>早餐</option>
-                <option value="上午加餐" ${currentMealName === '上午加餐' ? 'selected' : ''}>上午加餐</option>
-                <option value="午餐" ${currentMealName === '午餐' ? 'selected' : ''}>午餐</option>
-                <option value="下午加餐" ${currentMealName === '下午加餐' ? 'selected' : ''}>下午加餐</option>
-                <option value="晚餐" ${currentMealName === '晚餐' ? 'selected' : ''}>晚餐</option>
-                <option value="晚上加餐" ${currentMealName === '晚上加餐' ? 'selected' : ''}>晚上加餐</option>
-            </select><br>
-            <strong>加餐類型：</strong>
-            <select id="editSnackType_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                <option value="水果" ${snackType === '水果' ? 'selected' : ''}>水果</option>
-                <option value="零食" ${snackType === '零食' ? 'selected' : ''}>零食</option>
-                <option value="飲料" ${snackType === '飲料' ? 'selected' : ''}>飲料</option>
-                <option value="堅果" ${snackType === '堅果' ? 'selected' : ''}>堅果</option>
-                <option value="甜品" ${snackType === '甜品' ? 'selected' : ''}>甜品</option>
-                <option value="其他" ${snackType === '其他' ? 'selected' : ''}>其他</option>
-            </select><br>
-            <strong>已上傳照片：</strong>
-            ${mealData.photos.map((photo, i) => `<br><img src="${photo}" alt="照片 ${i + 1}" class="uploaded-image" style="margin:8px 0;">`).join('')}<br>
-            <strong>進食時間：</strong><div id="editSnackTimeContainer_${uniqueId}" style="display: inline-block;"></div><br>
-            <strong>食物名稱：</strong><input type="text" id="editSnackName_${uniqueId}" value="${mealData.snackName}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;"><br>
-            <strong>估計分量：</strong><input type="text" id="editSnackAmount_${uniqueId}" value="${mealData.snackAmount}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;"><br><br>
-            <button class="submit-info-btn" onclick="finalizeRecord(${uniqueId})" style="margin-top:10px; width: 100%;">保存${currentMealName}記錄</button>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    const timeDropdowns = generateTimeDropdowns(mealData.mealTime, `editSnackTime_${uniqueId}`);
-    const container = document.getElementById(`editSnackTimeContainer_${uniqueId}`);
-    if (container) {
-        container.innerHTML = timeDropdowns.html;
-    }
-}
-
-// Enable chat input
-function enableChatInput() {
-    const chatInput = document.getElementById('chatInput');
-    const chatSend = document.getElementById('chatSend');
-    
-    chatInput.disabled = false;
-    chatSend.disabled = false;
-    chatInput.focus();
-}
-
-// Validate food amounts
-function validateFoodAmounts(description) {
-    const foodsWithoutAmount = [];
-    const items = description.trim().split(/\s+/);
-    
-    for (const item of items) {
-        if (item.trim() === '') continue;
-        if (!item.includes('-')) {
-            foodsWithoutAmount.push(item);
-        }
-    }
-    
-    return foodsWithoutAmount;
-}
-
-// Submit additional information
-window.submitAdditionalInfo = function() {
-    const timePickerInputs = document.querySelectorAll('#mealTimePicker');
-    const timePickerInput = timePickerInputs.length > 0 ? timePickerInputs[timePickerInputs.length - 1] : null;
-    const location = document.querySelector('input[name="location"]:checked');
-    const amount = document.querySelector('input[name="amount"]:checked');
-
-    if (!timePickerInput || !timePickerInput.value) {
-        alert('請填寫用餐時間');
-        return;
-    }
-    
-    if (!location) {
-        alert('請選擇用餐地點');
-        return;
-    }
-    
-    if (!amount) {
-        alert('請選擇進食情況');
-        return;
-    }
-    
-    const mealTime = timePickerInput.value;
-    const locationLabel = location.value;
-    const amountLabel = amount.value;
-    
-    mealData.mealTime = mealTime;
-    mealData.location = locationLabel;
-    mealData.amount = amountLabel;
-    
-    currentRecordData.mealTime = mealTime;
-    currentRecordData.location = locationLabel;
-    currentRecordData.amount = amountLabel;
-    
-    const userMsg = document.createElement('div');
-    userMsg.className = 'user-message';
-    userMsg.innerHTML = `
-        <div class="message-content">
-            用餐時間：${mealTime}<br>
-            用餐地點：${locationLabel}<br>
-            進食情況：${amountLabel}
-        </div>
-    `;
-    chatMessagesEl.appendChild(userMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>第4步：如有需要，補充描述</strong><br>
-            <span class="step4-hint">（如果覺得照片無法完全體現，請簡單描述）</span>
-            <div class="more-photos-buttons" style="margin-top:8px;">
-                <button class="no-btn" onclick="skipStep4()">無</button>
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    enableStep4Input();
-};
-
-// Enable Step 4 input
-function enableStep4Input() {
-    const chatInput = document.getElementById('chatInput');
-    const chatSend = document.getElementById('chatSend');
-    step4Active = true;
-    step4Temp.answered = false;
-    
-    chatInput.disabled = false;
-    chatSend.disabled = false;
-    chatInput.placeholder = '如無補充描述，可點擊發送或按回車鍵';
-    chatInput.focus();
-    
-    step4Temp.handler = function() {
-        if (step4Temp.answered) return;
-        step4Temp.answered = true;
-        const message = chatInput.value.trim();
-        mealData.additionalDesc = message || '無';
-        const userMsg = document.createElement('div');
-        userMsg.className = 'user-message';
-        userMsg.innerHTML = `
-            <div class="message-content">
-                ${message || '（無補充描述）'}
-            </div>
-        `;
-        chatMessagesEl.appendChild(userMsg);
-        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-        chatInput.value = '';
-        chatInput.disabled = true;
-        chatSend.disabled = true;
-        chatInput.placeholder = '輸入訊息...';
-        chatSend.removeEventListener('click', step4Temp.handler);
-        chatInput.removeEventListener('keypress', step4Temp.keyHandler);
-        step4Active = false;
-        
-        if (summaryBubbleShown) return;
-        summaryBubbleShown = true;
-        const uniqueId = Date.now();
-        const botMsg = document.createElement('div');
-        botMsg.className = 'bot-message';
-        botMsg.setAttribute('data-summary-id', uniqueId);
-        botMsg.innerHTML = `
-            <div class="message-content">
-                <strong>記錄摘要：</strong><br><br>
-                <strong>記錄日期：</strong>${getRecordDateLabel()}<br>
-                <strong>餐次：</strong>
-                <select id="editMealType_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                    <option value="早餐" ${currentMealName === '早餐' ? 'selected' : ''}>早餐</option>
-                    <option value="上午加餐" ${currentMealName === '上午加餐' ? 'selected' : ''}>上午加餐</option>
-                    <option value="午餐" ${currentMealName === '午餐' ? 'selected' : ''}>午餐</option>
-                    <option value="下午加餐" ${currentMealName === '下午加餐' ? 'selected' : ''}>下午加餐</option>
-                    <option value="晚餐" ${currentMealName === '晚餐' ? 'selected' : ''}>晚餐</option>
-                    <option value="晚上加餐" ${currentMealName === '晚上加餐' ? 'selected' : ''}>晚上加餐</option>
-                </select><br>
-                <br><strong>已上傳照片及描述：</strong>
-                ${mealData.photos.map((photo, i) => {
-                    const batchIdx = mealData.photoBatchIndices[i] !== undefined ? mealData.photoBatchIndices[i] : 0;
-                    const descValue = mealData.descriptions && mealData.descriptions[batchIdx] ? mealData.descriptions[batchIdx] : '';
-                    return `
-                    <div style="margin:8px 0;">
-                        <img src="${photo}" alt="照片 ${i + 1}" class="uploaded-image">
-                        <br><textarea id="desc${i}_${uniqueId}" style="width: 100%; padding: 5px; border: 1px solid #ccc; border-radius: 5px; font-family: inherit; font-size: 12px;" rows="2">${descValue || ''}</textarea>
-                    </div>
-                `;
-                }).join('')}
-                <strong>用餐時間：</strong><div id="editMealTimeContainer_${uniqueId}" style="display: inline-block;"></div><br>
-                <strong>用餐地點：</strong>
-                <select id="editLocation_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                    <option value="家" ${mealData.location === '家' ? 'selected' : ''}>家</option>
-                    <option value="工作單位" ${mealData.location === '工作單位' ? 'selected' : ''}>工作單位</option>
-                    <option value="餐廳/外賣" ${mealData.location === '餐廳/外賣' ? 'selected' : ''}>餐廳/外賣</option>
-                    <option value="其他" ${mealData.location === '其他' ? 'selected' : ''}>其他</option>
-                </select><br>
-                <br><strong>進食情況：</strong>
-                <select id="editAmount_${uniqueId}" style="padding: 5px; border: 1px solid #ccc; border-radius: 5px; width: 100%;">
-                    <option value="全部吃完" ${mealData.amount === '全部吃完' ? 'selected' : ''}>全部吃完</option>
-                    <option value="剩餘一些" ${mealData.amount === '剩餘一些' ? 'selected' : ''}>剩餘一些</option>
-                    <option value="只吃少量" ${mealData.amount === '只吃少量' ? 'selected' : ''}>只吃少量</option>
-                </select><br>
-                <br><strong>補充描述：</strong><textarea id="editAdditionalDesc_${uniqueId}" style="width: 100%; padding: 5px; border: 1px solid #ccc; border-radius: 5px; font-family: inherit; font-size: 12px;" rows="2">${mealData.additionalDesc}</textarea><br><br>
-                <button class="submit-info-btn" onclick="finalizeRecord(${uniqueId})" style="margin-top:10px; width: 100%;">保存${currentMealName}記錄</button>
-            </div>
-        `;
-        chatMessagesEl.appendChild(botMsg);
-        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-        
-        const timeDropdowns = generateTimeDropdowns(mealData.mealTime, `editMealTime_${uniqueId}`);
-        const container = document.getElementById(`editMealTimeContainer_${uniqueId}`);
-        if (container) {
-            container.innerHTML = timeDropdowns.html;
-        }
-    };
-    
-    chatSend.addEventListener('click', step4Temp.handler);
-    step4Temp.keyHandler = function(e) {
-        if (e.key === 'Enter') {
-            step4Temp.handler();
-        }
-    };
-    chatInput.addEventListener('keypress', step4Temp.keyHandler);
-}
-
-// Send chat message
-function sendChatMessage() {
-    const chatInput = document.getElementById('chatInput');
-    const message = chatInput.value.trim();
-    if (step4Active) {
-        return;
-    }
-    
-    if (message) {
-        if (currentAmountQuestion) {
-            const amount = message;
-            const foodName = currentAmountQuestion.foodName;
-            const originalDesc = currentAmountQuestion.originalDesc;
-            
-            const updatedDesc = originalDesc.replace(foodName, `${foodName}-${amount}`);
-            mealData.descriptions[mealData.descriptions.length - 1] = updatedDesc;
-            
-            const userMsg = document.createElement('div');
-            userMsg.className = 'user-message';
-            userMsg.innerHTML = `
-                <div class="message-content">
-                    ${amount}
-                </div>
-            `;
-            chatMessagesEl.appendChild(userMsg);
-            chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-            
-            chatInput.value = '';
-            
-            pendingAmountQuestions.shift();
-            if (pendingAmountQuestions.length > 0) {
-                currentAmountQuestion = pendingAmountQuestions[0];
-                setTimeout(() => {
-                    const botMsg = document.createElement('div');
-                    botMsg.className = 'bot-message';
-                    botMsg.innerHTML = `
-                        <div class="message-content">
-                            請問${currentAmountQuestion.foodName}吃了多少？
-                        </div>
-                    `;
-                    chatMessagesEl.appendChild(botMsg);
-                    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-                }, 300);
-            } else {
-                currentAmountQuestion = null;
-                chatInput.disabled = true;
-                document.getElementById('chatSend').disabled = true;
-                setTimeout(() => {
-                    askMorePhotos();
-                }, 500);
-            }
-            return;
-        }
-        
-        const userMsg = document.createElement('div');
-        userMsg.className = 'user-message';
-        userMsg.innerHTML = `
-            <div class="message-content">
-                ${message}
-            </div>
-        `;
-        chatMessagesEl.appendChild(userMsg);
-        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-        
-        mealData.descriptions.push(message);
-        
-        const foodsWithoutAmount = validateFoodAmounts(message);
-        
-        if (foodsWithoutAmount.length > 0) {
-            chatInput.value = '';
-            chatInput.disabled = false;
-            document.getElementById('chatSend').disabled = false;
-            
-            pendingAmountQuestions = foodsWithoutAmount.map(food => ({
-                foodName: food,
-                originalDesc: message
-            }));
-            currentAmountQuestion = pendingAmountQuestions[0];
-            
-            setTimeout(() => {
-                const botMsg = document.createElement('div');
-                botMsg.className = 'bot-message';
-                botMsg.innerHTML = `
-                    <div class="message-content">
-                        請問${currentAmountQuestion.foodName}吃了多少？
-                    </div>
-                `;
-                chatMessagesEl.appendChild(botMsg);
-                chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-            }, 300);
-            return;
-        }
-        
-        chatInput.value = '';
-        chatInput.disabled = true;
-        document.getElementById('chatSend').disabled = true;
-        
-        setTimeout(() => {
-            askMorePhotos();
-        }, 500);
-    }
-}
-
-// Reset form
-window.resetForm = function() {
-    if (confirm('確定要重新開始嗎？所有填寫的資訊將被清除。')) {
-        chatMessagesEl.innerHTML = '';
-        
-        userSelectionMsgEl = null;
-        uploadPromptShown = false;
-        cameraStream = null;
-        currentFlow = 'main';
-        snackType = null;
-        currentMealName = '';
-        recordedMeals = {};
-        mealData = {
-            photoCount: 0,
-            photos: [],
-            descriptions: [],
-            photoBatchIndices: [],
-            currentBatchIndex: -1,
-            mealTime: '',
-            location: '',
-            amount: '',
-            additionalDesc: '',
-            snackName: '',
-            snackAmount: ''
-        };
-        
-        const chatInput = document.getElementById('chatInput');
-        const chatSend = document.getElementById('chatSend');
-        const resetBtn = document.getElementById('resetBtn');
-        const actionButtons = document.getElementById('actionButtons');
-        
-        chatInput.disabled = true;
-        chatSend.disabled = true;
-        chatInput.style.display = '';
-        chatSend.style.display = '';
-        if (resetBtn) resetBtn.style.display = '';
-        if (actionButtons) actionButtons.style.display = 'none';
-        
-        const botMsg = document.createElement('div');
-        botMsg.className = 'bot-message';
-        botMsg.innerHTML = `
-            <div class="message-content">
-                <strong>記錄流程</strong><br>
-                Step 1：選擇記錄日期<br>
-                Step 2：選擇餐次記錄卡片<br>
-                Step 3：拍照上傳您的飲食圖片並給出簡單的文字描述
-            </div>
-        `;
-        chatMessagesEl.appendChild(botMsg);
-        
-        const mealMsg = document.createElement('div');
-        mealMsg.className = 'bot-message';
-        mealMsg.innerHTML = `
-            <div class="message-content">
-                <strong>記錄日期：</strong><br>
-                <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 8px;">
-                    <label style="display: flex; align-items: center; cursor: pointer;">
-                        <input type="radio" name="recordDate" value="workday1" style="margin-right: 8px;">
-                        <span>第一個工作日</span>
-                    </label>
-                    <label style="display: flex; align-items: center; cursor: pointer;">
-                        <input type="radio" name="recordDate" value="workday2" style="margin-right: 8px;">
-                        <span>第二個工作日</span>
-                    </label>
-                    <label style="display: flex; align-items: center; cursor: pointer;">
-                        <input type="radio" name="recordDate" value="restday" style="margin-right: 8px;">
-                        <span>第一個休息日</span>
-                    </label>
-                </div>
-                <button onclick="confirmDateSelection()" style="width: 100%; margin-top: 12px; padding: 8px; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: bold;">確認</button>
-            </div>
-        `;
-        chatMessagesEl.appendChild(mealMsg);
-        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-        
-        document.querySelectorAll('.meal-option').forEach((btn) => {
-            btn.removeEventListener('click', handleMealOptionClick);
-            btn.addEventListener('click', handleMealOptionClick);
-        });
-    }
-};
-
-// Start new record
-window.startNewRecord = function() {
-    userSelectionMsgEl = null;
-    uploadPromptShown = false;
-    cameraStream = null;
-    currentFlow = 'main';
-    snackType = null;
-    summaryBubbleShown = false;
-    uploadPromptShown = false;
-    currentMealName = '';
-    currentRecordData = {
-        mealTime: '',
-        location: '',
-        amount: ''
-    };
-    mealData = {
-        photoCount: 0,
-        photos: [],
-        descriptions: [],
-        photoBatchIndices: [],
-        currentBatchIndex: -1,
-        mealTime: '',
-        location: '',
-        amount: '',
-        additionalDesc: '',
-        snackName: '',
-        snackAmount: ''
-    };
-    
-    const chatInput = document.getElementById('chatInput');
-    const chatSend = document.getElementById('chatSend');
-    const resetBtn = document.getElementById('resetBtn');
-    const actionButtons = document.getElementById('actionButtons');
-    
-    chatInput.value = '';
-    chatInput.disabled = true;
-    chatSend.disabled = true;
-    chatInput.style.display = '';
-    chatSend.style.display = '';
-    if (resetBtn) resetBtn.style.display = '';
-    if (actionButtons) actionButtons.style.display = 'none';
-    
-    const mealMsg = document.createElement('div');
-    mealMsg.className = 'bot-message';
-    mealMsg.innerHTML = `
-        <div class="message-content">
-            <strong>請選擇您要記錄的餐次：</strong>
-            <div class="meal-options">
-                <button class="meal-option" data-value="breakfast"><strong>早餐</strong>（通常6:00-9:00）</button>
-                <button class="meal-option" data-value="snack_morning"><strong>上午加餐</strong>（9:00-11:00）</button>
-                <button class="meal-option" data-value="lunch"><strong>午餐</strong>（11:00-13:30）</button>
-                <button class="meal-option" data-value="snack_afternoon"><strong>下午加餐</strong>（14:00-17:00）</button>
-                <button class="meal-option" data-value="dinner"><strong>晚餐</strong>（17:00-20:00）</button>
-                <button class="meal-option" data-value="snack_night"><strong>晚上加餐</strong>（20:00-睡前）</button>
-            </div>
-            <div id="mealSelectionStatus" class="selection-status"></div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(mealMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    document.querySelectorAll('.meal-option').forEach((btn) => {
-        btn.removeEventListener('click', handleMealOptionClick);
-        btn.addEventListener('click', handleMealOptionClick);
-    });
-};
-
-// Start new day
-window.startNewDay = function() {
-    recordedMeals = {};
-    
-    userSelectionMsgEl = null;
-    uploadPromptShown = false;
-    cameraStream = null;
-    currentFlow = 'main';
-    snackType = null;
-    summaryBubbleShown = false;
-    uploadPromptShown = false;
-    currentMealName = '';
-    currentRecordData = {
-        mealTime: '',
-        location: '',
-        amount: ''
-    };
-    mealData = {
-        photoCount: 0,
-        photos: [],
-        descriptions: [],
-        photoBatchIndices: [],
-        currentBatchIndex: -1,
-        mealTime: '',
-        location: '',
-        amount: '',
-        additionalDesc: '',
-        snackName: '',
-        snackAmount: ''
-    };
-    
-    isDateLocked = false;
-    const recordDateSelect = document.getElementById('recordDate');
-    if (recordDateSelect) {
-        recordDateSelect.value = '';
-        recordDateSelect.disabled = false;
-    }
-    document.querySelectorAll('input[name="recordDate"]').forEach(radio => {
-        radio.checked = false;
-    });
-    
-    const chatInput = document.getElementById('chatInput');
-    const chatSend = document.getElementById('chatSend');
-    const resetBtn = document.getElementById('resetBtn');
-    const actionButtons = document.getElementById('actionButtons');
-    
-    chatInput.value = '';
-    chatInput.disabled = true;
-    chatSend.disabled = true;
-    chatInput.style.display = '';
-    chatSend.style.display = '';
-    if (resetBtn) resetBtn.style.display = '';
-    if (actionButtons) actionButtons.style.display = 'none';
-    
-    const mealMsg = document.createElement('div');
-    mealMsg.className = 'bot-message';
-    mealMsg.innerHTML = `
-        <div class="message-content">
-            <strong>記錄日期：</strong><br>
-            <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 8px;">
-                <label style="display: flex; align-items: center; cursor: pointer;">
-                    <input type="radio" name="recordDate" value="workday1" style="margin-right: 8px;">
-                    <span>第一個工作日</span>
-                </label>
-                <label style="display: flex; align-items: center; cursor: pointer;">
-                    <input type="radio" name="recordDate" value="workday2" style="margin-right: 8px;">
-                    <span>第二個工作日</span>
-                </label>
-                <label style="display: flex; align-items: center; cursor: pointer;">
-                    <input type="radio" name="recordDate" value="restday" style="margin-right: 8px;">
-                    <span>第一個休息日</span>
-                </label>
-            </div>
-            <button onclick="confirmDateSelection()" style="width: 100%; margin-top: 12px; padding: 8px; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: bold;">確認</button>
-        </div>
-    `;
-    chatMessagesEl.appendChild(mealMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-};
-
-// Update meal option buttons
-function updateMealOptionButtons() {
-    const mainMeals = ['早餐', '午餐', '晚餐'];
-    document.querySelectorAll('.meal-option').forEach((btn) => {
-        const mealValue = btn.getAttribute('data-value');
-        if ((mealValue === 'breakfast' || mealValue === 'lunch' || mealValue === 'dinner')) {
-            const label = btn.textContent.trim();
-            const mealName = extractMealName(label);
-            if (recordedMeals[mealName]) {
-                btn.disabled = true;
-                btn.classList.add('disabled');
-            }
-        }
-    });
-}
-
-// Generate time dropdowns (HTML5 time input)
-function generateTimeDropdowns(currentTime, idPrefix = '') {
-    const normalizeTimeString = (timeStr) => {
-        if (timeStr && timeStr.includes(':')) {
-            const parts = timeStr.split(':');
-            const hour = Math.min(Math.max(parseInt(parts[0], 10) || 0, 0), 23).toString().padStart(2, '0');
-            const minute = Math.min(Math.max(parseInt(parts[1], 10) || 0, 0), 59).toString().padStart(2, '0');
-            return `${hour}:${minute}`;
-        }
-        return '00:00';
-    };
-    
-    const timeValue = normalizeTimeString(currentTime);
-    const timeId = idPrefix ? `${idPrefix}Picker` : 'mealTimePicker';
-    
-    return {
-        html: `
-            <div style="display: flex; align-items: center; gap: 10px; margin-top: 8px;">
-                <input id="${timeId}" type="time" value="${timeValue}" style="padding: 8px 12px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; cursor: pointer;">
-            </div>
-        `,
-        getTime: () => {
-            const timeInput = document.getElementById(timeId);
-            return timeInput ? timeInput.value : timeValue;
-        }
-    };
-}
-
-// Finalize record
-window.finalizeRecord = function(uniqueId) {
-    const editMealType = uniqueId ? document.getElementById(`editMealType_${uniqueId}`) : document.querySelector('[id^="editMealType"]');
-    const editMealTimePicker = uniqueId ? document.getElementById(`editMealTimePicker_${uniqueId}`) : document.querySelector('[id^="editMealTimePicker"]');
-    const editLocation = uniqueId ? document.getElementById(`editLocation_${uniqueId}`) : document.querySelector('[id^="editLocation"]');
-    const editAmount = uniqueId ? document.getElementById(`editAmount_${uniqueId}`) : document.querySelector('[id^="editAmount"]');
-    const editAdditionalDesc = uniqueId ? document.getElementById(`editAdditionalDesc_${uniqueId}`) : document.querySelector('[id^="editAdditionalDesc"]');
-
-    let finalData = { ...currentRecordData };
-
-    if (editMealTimePicker) {
-        finalData.mealTime = editMealTimePicker.value || finalData.mealTime;
-        mealData.mealTime = editMealTimePicker.value || finalData.mealTime;
-    }
-    if (editLocation) finalData.location = editLocation.value || finalData.location || '';
-    if (editAmount) finalData.amount = editAmount.value || finalData.amount || '';
-    
-    const finalDescriptions = [];
-    for (let i = 0; i < mealData.descriptions.length; i++) {
-        const batchKey = i.toString();
-        const descField = uniqueId ? document.getElementById(`desc${batchKey}_${uniqueId}`) : document.getElementById(`desc${batchKey}`);
-        if (descField) {
-            finalDescriptions.push(descField.value);
-        } else {
-            finalDescriptions.push(mealData.descriptions[i]);
-        }
-    }
-    mealData.descriptions = finalDescriptions;
-
-    if (editAdditionalDesc) {
-        mealData.additionalDesc = editAdditionalDesc.value || mealData.additionalDesc || '';
-    }
-
-    const mealToRecord = editMealType ? editMealType.value : currentMealName;
-    
-    if (currentFlow === 'snack') {
-        const editSnackType = uniqueId ? document.getElementById(`editSnackType_${uniqueId}`) : document.querySelector('[id^="editSnackType"]');
-        const editSnackName = uniqueId ? document.getElementById(`editSnackName_${uniqueId}`) : document.querySelector('[id^="editSnackName"]');
-        const editSnackAmount = uniqueId ? document.getElementById(`editSnackAmount_${uniqueId}`) : document.querySelector('[id^="editSnackAmount"]');
-        const editSnackTimePicker = uniqueId ? document.getElementById(`editSnackTimePicker_${uniqueId}`) : document.querySelector('[id^="editSnackTimePicker"]');
-        
-        if (editSnackTimePicker && editSnackTimePicker.value) {
-            finalData.mealTime = editSnackTimePicker.value;
-            mealData.mealTime = editSnackTimePicker.value;
-        }
-        
-        const snackRecord = {
-            name: mealToRecord,
-            mealTime: finalData.mealTime || mealData.mealTime || '不詳',
-            location: editSnackType ? editSnackType.value : (snackType || mealData.snackName || '不詳'),
-            snackType: editSnackType ? editSnackType.value : (snackType || ''),
-            amount: mealData.amount || '',
-            additionalDesc: mealData.additionalDesc || '',
-            snackName: editSnackName ? editSnackName.value : (mealData.snackName || ''),
-            snackAmount: editSnackAmount ? editSnackAmount.value : (mealData.snackAmount || ''),
-            photoCount: mealData.photoCount || 0,
-            photos: [...mealData.photos],
-            descriptions: [...mealData.descriptions]
-        };
-        
-        if (!recordedMeals[mealToRecord]) {
-            recordedMeals[mealToRecord] = [];
-        } else if (!Array.isArray(recordedMeals[mealToRecord])) {
-            recordedMeals[mealToRecord] = [recordedMeals[mealToRecord]];
-        }
-        recordedMeals[mealToRecord].push(snackRecord);
-    } else {
-        recordedMeals[mealToRecord] = {
-            name: mealToRecord,
-            mealTime: finalData.mealTime || '不詳',
-            location: finalData.location || '不詳',
-            amount: finalData.amount || '',
-            additionalDesc: mealData.additionalDesc || '',
-            photoCount: mealData.photoCount || 0,
-            photos: [...mealData.photos],
-            descriptions: [...mealData.descriptions]
-        };
-    }
-
-    summaryBubbleShown = false;
-    currentMealName = '';
-    currentRecordData = {
-        mealTime: '',
-        location: '',
-        amount: ''
-    };
-    mealData = {
-        photoCount: 0,
-        photos: [],
-        descriptions: [],
-        photoBatchIndices: [],
-        currentBatchIndex: -1,
-        mealTime: '',
-        location: '',
-        amount: '',
-        additionalDesc: '',
-        snackName: '',
-        snackAmount: ''
-    };
-    currentFlow = 'main';
-    snackType = null;
-
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>感謝您的填寫！</strong><br>
-            ${mealToRecord}記錄已成功保存。
-            <div style="display: flex; gap: 10px; margin-top: 12px;">
-                <button class="action-btn new-record-btn" onclick="startNewRecord()" style="flex: 1; padding: 10px 12px; border: none; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: white;">繼續記錄其他餐次</button>
-                <button class="action-btn finish-btn" onclick="finishDailyRecord()" style="flex: 1; padding: 10px 12px; border: none; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold; background-color: #6b7280; color: white;">完成今日飲食記錄</button>
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    setTimeout(() => {
-        window.updateRecordsSummary();
-    }, 100);
-
-    document.querySelectorAll('.meal-option').forEach((btn) => {
-        const dataValue = btn.getAttribute('data-value');
-        const label = btn.textContent.trim();
-        const mealName = extractMealName(label);
-        
-        if ((dataValue === 'breakfast' || dataValue === 'lunch' || dataValue === 'dinner') && recordedMeals[mealName]) {
-            btn.disabled = true;
-            btn.classList.add('disabled');
-        } else {
-            btn.disabled = false;
-            btn.classList.remove('disabled', 'selected');
-        }
-    });
-};
-
-// Finish daily record
-window.finishDailyRecord = function() {
-    const recordDateSelect = document.getElementById('recordDate');
-    let dateLabel = '記錄';
-    if (recordDateSelect) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        dateLabel = selectedOption.text;
-    }
-    
-    const allMeals = [
-        { id: 'breakfast', name: '早餐', time: '6:00-9:00' },
-        { id: 'snack_morning', name: '上午加餐', time: '9:00-11:00' },
-        { id: 'lunch', name: '午餐', time: '11:00-13:30' },
-        { id: 'snack_afternoon', name: '下午加餐', time: '14:00-17:00' },
-        { id: 'dinner', name: '晚餐', time: '18:00-20:00' },
-        { id: 'snack_night', name: '晚上加餐', time: '20:00-睡前' }
-    ];
-    
-    const recorded = allMeals.filter(m => recordedMeals[m.name]);
-    const missing = allMeals.filter(m => !recordedMeals[m.name]);
-    
-    const totalMeals = allMeals.length;
-    const recordedCount = recorded.length;
-    const progressPercent = Math.round((recordedCount / totalMeals) * 100);
-    
-    const recordedList = recorded.flatMap(meal => {
-        const record = recordedMeals[meal.name];
-        const isSnack = meal.id.includes('snack');
-        
-        if (Array.isArray(record)) {
-            return record.map(snack => {
-                const time = snack.mealTime || snack.time || '';
-                const amount = snack.snackAmount || snack.amount || '';
-                return `•${meal.name}（${time}，${amount}）`;
-            });
-        } else if (record) {
-            const time = record.mealTime || record.time || '';
-            if (isSnack) {
-                const amount = record.snackAmount || record.amount || '';
-                return `•${meal.name}（${time}，${amount}）`;
-            } else {
-                const location = record.location || '';
-                return `•${meal.name}（${time}，${location}）`;
-            }
-        }
-        return [];
-    }).join('<br>');
-    
-    const missingList = missing.map(meal => {
-        return `•${meal.name}（通常${meal.time}）`;
-    }).join('<br>');
-    
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>${dateLabel}記錄完成情況</strong><br><br>
-            
-            <strong>已記錄餐次（${recordedCount}）：</strong><br>
-            ${recordedList}<br><br>
-            
-            <strong>可能遺漏：</strong><br>
-            ${missingList}<br><br>
-            
-            <strong>完成率：${progressPercent}%</strong><br>
-            <div style="background: #ddd; border-radius: 10px; height: 20px; overflow: hidden; margin: 8px 0;">
-                <div style="background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); height: 100%; width: ${progressPercent}%; transition: width 0.3s;"></div>
-            </div><br>
-            
-            <strong>溫馨提示：</strong><br>
-            <em>建議您在睡前花 2 分鐘檢查：</em><br>
-            1. 是否記錄了所有吃喝的東西？<br>
-            2. 每餐是否有拍攝照片？<br>
-            3. 時間地點是否填寫？<br><br>
-            
-            <div class="action-buttons-container" style="display: flex; gap: 10px; margin-top: 15px;">
-                <button class="action-btn new-record-btn" onclick="supplementRecords()">立即補充記錄</button>
-                <button class="action-btn finish-btn" onclick="continueNextDay()">明日繼續記錄</button>
-            </div>
-            <button class="action-btn" style="flex: 1; width: 100%; margin-top: 10px; background: #8b5cf6; color: white; padding: 10px 20px; border: none; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold;" onclick="viewAllRecords()">查看我的記錄</button>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Continue to next day
-window.continueNextDay = function() {
-    const recordDateSelect = document.getElementById('recordDate');
-    let dateLabel = '記錄';
-    if (recordDateSelect) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        dateLabel = selectedOption.text;
-    }
-    
-    const today = dateLabel;
-    allDailyRecords[today] = { ...recordedMeals };
-    
-    recordedMeals = {};
-    uploadPromptShown = false;
-    
-    document.querySelectorAll('.meal-option').forEach((btn) => {
-        btn.disabled = false;
-        btn.classList.remove('disabled');
-    });
-    
-    isDateLocked = false;
-    if (recordDateSelect) {
-        recordDateSelect.disabled = false;
-    }
-    
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>感謝您的記錄！</strong><br>
-            ${today}記錄已保存。<br><br>
-            <div class="action-buttons-container" style="display: flex; gap: 10px; margin-top: 15px;">
-                <button class="action-btn new-record-btn" onclick="startNewDay()">開始新的記錄日</button>
-                <button class="action-btn" style="background: #8b5cf6; color: white;" onclick="viewAllRecords()">查看我的記錄</button>
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// View all records
-window.viewAllRecords = function() {
-    let workdayCount = 0;
-    let restdayCount = 0;
-    
-    for (const date in allDailyRecords) {
-        if (date.includes('工作日')) workdayCount++;
-        else if (date.includes('休息日')) restdayCount++;
-    }
-    
-    const recordDateSelect = document.getElementById('recordDate');
-    if (recordDateSelect && recordDateSelect.value && Object.keys(recordedMeals).length > 0) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        const currentDateLabel = selectedOption.text;
-        
-        let isCurrentDayRecorded = false;
-        for (const date in allDailyRecords) {
-            if (date === currentDateLabel) {
-                isCurrentDayRecorded = true;
-                break;
-            }
-        }
-        
-        if (!isCurrentDayRecorded) {
-            if (currentDateLabel.includes('工作日')) workdayCount++;
-            else if (currentDateLabel.includes('休息日')) restdayCount++;
-        }
-    }
-    
-    const mealCounts = {
-        '早餐': 0,
-        '午餐': 0,
-        '晚餐': 0
-    };
-    
-    let totalPhotos = 0;
-    
-    for (const date in allDailyRecords) {
-        const meals = allDailyRecords[date];
-        for (const mealName in meals) {
-            const record = meals[mealName];
-            
-            if (Array.isArray(record)) {
-                for (const item of record) {
-                    totalPhotos += item.photoCount || 0;
-                }
-            } else if (record) {
-                totalPhotos += record.photoCount || 0;
-                
-                if (mealName === '早餐') {
-                    mealCounts['早餐']++;
-                } else if (mealName === '午餐') {
-                    mealCounts['午餐']++;
-                } else if (mealName === '晚餐') {
-                    mealCounts['晚餐']++;
-                }
-            }
-        }
-    }
-    
-    for (const mealName in recordedMeals) {
-        const record = recordedMeals[mealName];
-        
-        if (Array.isArray(record)) {
-            for (const snack of record) {
-                totalPhotos += snack.photoCount || 0;
-            }
-        } else if (record) {
-            totalPhotos += record.photoCount || 0;
-            
-            if (mealName === '早餐') {
-                mealCounts['早餐']++;
-            } else if (mealName === '午餐') {
-                mealCounts['午餐']++;
-            } else if (mealName === '晚餐') {
-                mealCounts['晚餐']++;
-            }
-        }
-    }
-    
-    const mealCountStr = `早餐×${mealCounts['早餐']}，午餐×${mealCounts['午餐']}，晚餐×${mealCounts['晚餐']}`;
-    
-    let recordedDaysCount = Object.keys(allDailyRecords).length;
-    if (Object.keys(recordedMeals).length > 0 && recordDateSelect && recordDateSelect.value) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        const currentDateLabel = selectedOption.text;
-        
-        let isCurrentDayRecorded = false;
-        for (const date in allDailyRecords) {
-            if (date === currentDateLabel) {
-                isCurrentDayRecorded = true;
-                break;
-            }
-        }
-        
-        if (!isCurrentDayRecorded) {
-            recordedDaysCount++;
-        }
-    }
-    
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.id = 'recordsSummaryBubble';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>恭喜！完成${recordedDaysCount}天記錄</strong><br><br>
-            
-            <strong>記錄週期：</strong>${workdayCount}個工作日+${restdayCount}個休息日<br>
-            <strong>完整餐次：</strong>${mealCountStr}<br>
-            <strong>上傳照片：</strong>${totalPhotos}張<br><br>
-            
-            <strong>非常感謝您的認真配合！您的記錄對我們非常重要。</strong><br><br>
-            
-            <div class="action-buttons-container" style="display: flex; gap: 10px; margin-top: 15px;">
-                <button class="action-btn" onclick="startNewDay()" style="flex: 1; padding: 10px 12px; border: none; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: white;">繼續添加記錄</button>
-            </div>
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-}
-
-// Update records summary
-window.updateRecordsSummary = function() {
-    const summaryBubble = document.getElementById('recordsSummaryBubble');
-    if (!summaryBubble) return;
-    
-    let workdayCount = 0;
-    let restdayCount = 0;
-    
-    for (const date in allDailyRecords) {
-        if (date.includes('工作日')) workdayCount++;
-        else if (date.includes('休息日')) restdayCount++;
-    }
-    
-    const recordDateSelect = document.getElementById('recordDate');
-    if (recordDateSelect && recordDateSelect.value && Object.keys(recordedMeals).length > 0) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        const currentDateLabel = selectedOption.text;
-        
-        let isCurrentDayRecorded = false;
-        for (const date in allDailyRecords) {
-            if (date === currentDateLabel) {
-                isCurrentDayRecorded = true;
-                break;
-            }
-        }
-        
-        if (!isCurrentDayRecorded) {
-            if (currentDateLabel.includes('工作日')) workdayCount++;
-            else if (currentDateLabel.includes('休息日')) restdayCount++;
-        }
-    }
-    
-    const mealCounts = {
-        '早餐': 0,
-        '午餐': 0,
-        '晚餐': 0
-    };
-    
-    let totalPhotos = 0;
-    
-    for (const date in allDailyRecords) {
-        const meals = allDailyRecords[date];
-        for (const mealName in meals) {
-            const record = meals[mealName];
-            
-            if (Array.isArray(record)) {
-                for (const item of record) {
-                    totalPhotos += item.photoCount || 0;
-                }
-            } else if (record) {
-                totalPhotos += record.photoCount || 0;
-                
-                if (mealName === '早餐') {
-                    mealCounts['早餐']++;
-                } else if (mealName === '午餐') {
-                    mealCounts['午餐']++;
-                } else if (mealName === '晚餐') {
-                    mealCounts['晚餐']++;
-                }
-            }
-        }
-    }
-    
-    for (const mealName in recordedMeals) {
-        const record = recordedMeals[mealName];
-        
-        if (Array.isArray(record)) {
-            for (const snack of record) {
-                totalPhotos += snack.photoCount || 0;
-            }
-        } else if (record) {
-            totalPhotos += record.photoCount || 0;
-            
-            if (mealName === '早餐') {
-                mealCounts['早餐']++;
-            } else if (mealName === '午餐') {
-                mealCounts['午餐']++;
-            } else if (mealName === '晚餐') {
-                mealCounts['晚餐']++;
-            }
-        }
-    }
-    
-    const mealCountStr = `早餐×${mealCounts['早餐']}，午餐×${mealCounts['午餐']}，晚餐×${mealCounts['晚餐']}`;
-    
-    let recordedDaysCount = Object.keys(allDailyRecords).length;
-    if (Object.keys(recordedMeals).length > 0 && recordDateSelect && recordDateSelect.value) {
-        const selectedOption = recordDateSelect.options[recordDateSelect.selectedIndex];
-        const currentDateLabel = selectedOption.text;
-        
-        let isCurrentDayRecorded = false;
-        for (const date in allDailyRecords) {
-            if (date === currentDateLabel) {
-                isCurrentDayRecorded = true;
-                break;
-            }
-        }
-        
-        if (!isCurrentDayRecorded) {
-            recordedDaysCount++;
-        }
-    }
-    
-    summaryBubble.querySelector('.message-content').innerHTML = `
-        <strong>恭喜！完成${recordedDaysCount}天記錄</strong><br><br>
-        
-        <strong>記錄週期：</strong>${workdayCount}個工作日+${restdayCount}個休息日<br>
-        <strong>完整餐次：</strong>${mealCountStr}<br>
-        <strong>上傳照片：</strong>${totalPhotos}張<br><br>
-        
-        <strong>非常感謝您的認真配合！您的記錄對我們非常重要。</strong><br><br>
-        
-        <div class="action-buttons-container" style="display: flex; gap: 10px; margin-top: 15px;">
-            <button class="action-btn" onclick="startNewDay()" style="flex: 1; padding: 10px 12px; border: none; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%); color: white;">繼續添加記錄</button>
-        </div>
-    `;
-}
-
-// Supplement records (for individual date completion - keeps current date)
-window.supplementRecords = function() {
-    window.startNewRecord();
-}
-
-// Supplement records with date selection first (for final summary)
-window.supplementRecordsWithDateSelect = function() {
-    // Reset to date selection
-    recordDateSelect.selectedIndex = 0;
-    recordedMeals = {};
-    mealPhotos = [];
-    mealDescriptions = [];
-    currentMealName = '';
-    snackType = '';
-    
-    // Show date selection message
-    const botMsg = document.createElement('div');
-    botMsg.className = 'bot-message';
-    botMsg.innerHTML = `
-        <div class="message-content">
-            <strong>請先選擇要補充記錄的日期：</strong><br><br>
-            選擇日期後，您可以為該天添加餐次記錄。
-        </div>
-    `;
-    chatMessagesEl.appendChild(botMsg);
-    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-    
-    // Scroll to date selector
-    setTimeout(() => {
-        recordDateSelect.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        recordDateSelect.focus();
-    }, 300);
-}
-
-// API Functions for saving to database
-
-// Save a single meal record to database
-async function saveMealToDatabase(mealRecord, recordDate, recordDateLabel) {
-    try {
-        const photos = mealRecord.photos.map((photo, index) => ({
-            photo_data: photo,
-            description: mealRecord.descriptions[index] || ''
-        }));
-
-        const payload = {
-            record_date: recordDate,
-            record_date_label: recordDateLabel,
-            meal_type: mealRecord.name,
-            meal_time: mealRecord.mealTime || '',
-            location: mealRecord.location || '',
-            eating_amount: mealRecord.amount || '',
-            additional_description: mealRecord.additionalDesc || '',
-            is_snack: mealRecord.snackType ? true : false,
-            snack_type: mealRecord.snackType || '',
-            snack_name: mealRecord.snackName || '',
-            snack_amount: mealRecord.snackAmount || '',
-            photos: photos
-        };
-
-        const response = await fetch('/api/save-meal-record', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(payload)
-        });
-
-        const result = await response.json();
-        
-        if (!result.success) {
-            console.error('Failed to save meal record:', result.message);
-            return false;
-        }
-        
-        console.log('Meal record saved successfully:', result);
-        return true;
-        
-    } catch (error) {
-        console.error('Error saving meal record:', error);
-        return false;
-    }
-}
-
-// Mark daily record as completed
-async function completeDailyRecordInDatabase(recordDate) {
-    try {
-        const response = await fetch('/api/complete-daily-record', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                record_date: recordDate
-            })
-        });
-
-        const result = await response.json();
-        
-        if (!result.success) {
-            console.error('Failed to complete daily record:', result.message);
-            return false;
-        }
-        
-        console.log('Daily record marked as completed:', result);
-        return true;
-        
-    } catch (error) {
-        console.error('Error completing daily record:', error);
-        return false;
-    }
-}
-
-// Modified finalizeRecord function to save to database
-const originalFinalizeRecord = window.finalizeRecord;
-window.finalizeRecord = async function(uniqueId) {
-    // Call original function first
-    originalFinalizeRecord(uniqueId);
-    
-    // Get current record date info
-    const recordDateSelect = document.getElementById('recordDate');
-    if (!recordDateSelect || !recordDateSelect.value) {
-        console.error('No record date selected');
-        return;
-    }
-    
-    const recordDate = recordDateSelect.value;
-    const recordDateLabel = recordDateSelect.options[recordDateSelect.selectedIndex].text;
-    
-    // Get the meal record that was just finalized
-    const editMealType = uniqueId ? document.getElementById(`editMealType_${uniqueId}`) : document.querySelector('[id^="editMealType"]');
-    const mealToRecord = editMealType ? editMealType.value : currentMealName;
-    
-    // Get the finalized meal data from recordedMeals
-    const mealRecord = recordedMeals[mealToRecord];
-    
-    if (!mealRecord) {
-        console.error('No meal record found for:', mealToRecord);
-        return;
-    }
-    
-    // Handle array (snacks) or single record
-    if (Array.isArray(mealRecord)) {
-        // Save the last snack record added
-        const lastSnack = mealRecord[mealRecord.length - 1];
-        await saveMealToDatabase(lastSnack, recordDate, recordDateLabel);
-    } else {
-        // Save single meal record
-        await saveMealToDatabase(mealRecord, recordDate, recordDateLabel);
-    }
-};
-
-// Modified continueNextDay to mark daily record as completed
-const originalContinueNextDay = window.continueNextDay;
-window.continueNextDay = async function() {
-    const recordDateSelect = document.getElementById('recordDate');
-    
-    if (recordDateSelect && recordDateSelect.value) {
-        const recordDate = recordDateSelect.value;
-        
-        // Mark as completed in database
-        await completeDailyRecordInDatabase(recordDate);
-    }
-    
-    // Call original function
-    originalContinueNextDay();
-};
+setupMealTimeInputs();
+initPageMode();

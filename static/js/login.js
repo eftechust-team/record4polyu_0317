@@ -34,7 +34,7 @@ if (loginForm) {
             }
 
             // Success - redirect
-            window.location.href = result.redirect || '/form';
+            window.location.href = result.redirect || '/hub';
 
         } catch (err) {
             console.error("Login Error:", err);
@@ -83,7 +83,7 @@ if (registerForm) {
 
             // Success
             alert('註冊成功！');
-            window.location.href = result.redirect || '/form';
+            window.location.href = result.redirect || '/hub';
 
         } catch (err) {
             console.error("Register Error:", err);

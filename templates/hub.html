@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>記錄入口</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/form-style.css">
+</head>
+<body class="form-page">
+    <div class="top-bar">
+        <a href="/hub" style="display:inline-flex; align-items:center; text-decoration:none;">
+            <img src="/static/logo.jpeg" alt="Logo" style="max-height: 48px; height: auto; flex-shrink: 0; cursor: pointer;">
+        </a>
+        <div style="display: flex; align-items: center; gap: 12px; flex-shrink: 0; margin-left: auto;">
+            <span>歡迎，{{ session.get('name', '參與者') }} (編號: {{ session.get('participant_id', '') }})</span>
+            <button type="button" onclick="logout()" class="logout-btn">登出</button>
+        </div>
+    </div>
+
+    <div class="container" style="width: 100%; max-width: 1100px; margin: 0 auto;">
+        <div class="content">
+            <div style="display: flex; justify-content: center; align-items: center; margin-bottom: 20px;">
+                <h2 class="section-title">記錄入口</h2>
+            </div>
+
+            <div class="exercise-section" style="margin-bottom: 18px;">
+                <h3 style="color: var(--text); font-size: 16px; margin-bottom: 12px;">請先選擇操作：</h3>
+                <div style="display: flex; gap: 10px; width: 100%;">
+                    <button type="button" class="submit-info-btn" style="flex: 1; max-width: none;" onclick="selectMode('add')">添加記錄</button>
+                    <button type="button" class="submit-info-btn" style="flex: 1; max-width: none; background:#6b7280;" onclick="selectMode('view')">查看記錄</button>
+                </div>
+            </div>
+
+            <div id="addFlow" class="exercise-section" style="display:none;">
+                <h3 style="color: var(--text); font-size: 16px; margin-bottom: 12px;">添加記錄設定</h3>
+                <div class="form-group">
+                    <label>記錄日期（第x個xx日）：</label>
+                    <select id="recordDateKey" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px;">
+                        <option value="">請選擇</option>
+                        <option value="workday1">第一個工作日</option>
+                        <option value="workday2">第二個工作日</option>
+                        <option value="restday">第一個休息日</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>實際日期：</label>
+                    <div style="display: flex; gap: 8px; align-items: center;">
+                        <button type="button" class="submit-info-btn" style="width: auto; min-width: 88px; padding: 10px 16px; flex-shrink: 0;" onclick="setTodayDate()">今日</button>
+                        <input id="recordRealDate" type="date" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px;">
+                    </div>
+                    <div style="margin-top: 6px; font-size: 12px; color: #666;">將以 dd/mm/yyyy 格式保存</div>
+                </div>
+                <div style="display: flex; gap: 10px; width: 100%;">
+                    <button type="button" class="submit-info-btn" style="flex: 1; max-width: none;" onclick="goToAdd('food')">飲食記錄</button>
+                    <button type="button" class="submit-info-btn" style="flex: 1; max-width: none; background:#10b981;" onclick="goToAdd('exercise')">活動記錄</button>
+                </div>
+            </div>
+
+            <div id="viewFlow" class="exercise-section" style="display:none;">
+                <h3 style="color: var(--text); font-size: 16px; margin-bottom: 12px;">查看記錄設定</h3>
+                <div class="form-group">
+                    <label>記錄日期（第x個xx日）：</label>
+                    <select id="viewDateKey" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 8px;">
+                        <option value="">請選擇</option>
+                        <option value="workday1">第一個工作日</option>
+                        <option value="workday2">第二個工作日</option>
+                        <option value="restday">第一個休息日</option>
+                    </select>
+                </div>
+                <div style="display: flex; gap: 10px; width: 100%;">
+                    <button type="button" class="submit-info-btn" style="flex: 1; max-width: none;" onclick="goToView('food')">查看飲食記錄</button>
+                    <button type="button" class="submit-info-btn" style="flex: 1; max-width: none; background:#10b981;" onclick="goToView('exercise')">查看活動記錄</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/hub-script.js?v=20260317-add-click-fix"></script>
+</body>
+</html>
