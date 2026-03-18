@@ -281,7 +281,10 @@ function buildInlineMealPhotoEditorHtml() {
     return `
         <div>
             <label style="font-size:12px; color:#475569;">圖片與食物描述</label>
-            <div style="margin-top:6px;">${rowsHtml}</div>
+            <div style="font-size:12px; color:#92400e; margin:2px 0 4px 0; padding:5px 8px; border-left:3px solid #f59e0b; background:#fffbeb; border-radius:6px; line-height:1.35;">
+                <strong>提示：</strong>若為<strong>包裝食品</strong>，請拍照上傳<strong>食物包裝</strong>及<strong>營養成分表</strong>
+            </div>
+            <div style="margin-top:2px;">${rowsHtml}</div>
             <button type="button" class="mini-btn mini-btn-primary" onclick="addMealEditPhotoRow()">+ 新增圖片列</button>
         </div>
     `;
